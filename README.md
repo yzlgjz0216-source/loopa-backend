@@ -36,6 +36,8 @@ npm start
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/users` | 创建测试用户 |
+| POST | `/api/payments/approve` | 批准一笔 Pi 支付(需配置 `PI_API_KEY`) |
+| POST | `/api/payments/complete` | 确认一笔 Pi 支付完成(需配置 `PI_API_KEY`) |
 | GET | `/api/conversations` | 获取当前用户的会话列表 |
 | POST | `/api/conversations/direct` | 创建/获取与某人的私信会话 |
 | POST | `/api/conversations/group` | 创建群聊 |

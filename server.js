@@ -64,6 +64,83 @@ app.post("/api/users", (req, res) => {
 
 
 /* -------------------------------------------------------------------------
+   Pi 支付接口:真正对接 Pi 官方服务端 API,完成 U2A 支付的"批准"和"完成"两步。
+
+   ⚠️ 这两个接口是 Pi 支付流程里"必须由服务端完成"的关键环节,不能省略:
+   用户在 Pi 钱包里点"同意"之后,支付并不会自动生效,必须由 App 的服务端
+   调用 Pi 官方 API 明确"批准"这笔支付,链上交易广播后还要再调用一次
+   "完成"接口确认交易哈希,整笔支付才算真正生效。
+
+   需要在 .env 里配置 PI_API_KEY(Pi Developer Portal 里该 App 的 Server API Key,
+   在"连接钱包"那一步完成后,App 详情页里可以找到)。
+   参考: https://github.com/pi-apps/pi-platform-docs/blob/master/SDK_reference.md#payments
+   ------------------------------------------------------------------------- */
+const PI_API_BASE = "https://api.minepi.com/v2";
+
+app.post("/api/payments/approve", async (req, res) => {
+  const { paymentId } = req.body;
+  if (!paymentId) return res.status(400).json({ error: "paymentId 必填" });
+  if (!process.env.PI_API_KEY) {
+    return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
+  }
+
+  try {
+    const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/approve`, {
+      method: "POST",
+      headers: { "Authorization": `Key ${process.env.PI_API_KEY}` },
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("[Pi API] 批准支付失败:", response.status, errText);
+      return res.status(502).json({ ok: false, error: "Pi 官方 API 批准失败", detail: errText });
+    }
+    const payment = await response.json();
+
+    // TODO(数据库联调点): 在这里把这笔待批准的支付记录写入自己的数据库(状态=已批准),
+    // 方便后续对账、以及在 complete 阶段核实这笔支付确实是本平台发起的。
+
+    res.json({ ok: true, payment });
+  } catch (err) {
+    console.error("[Pi API] 批准支付出错:", err);
+    res.status(500).json({ ok: false, error: "服务端调用 Pi API 出错" });
+  }
+});
+
+app.post("/api/payments/complete", async (req, res) => {
+  const { paymentId, txid } = req.body;
+  if (!paymentId || !txid) return res.status(400).json({ error: "paymentId 和 txid 必填" });
+  if (!process.env.PI_API_KEY) {
+    return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
+  }
+
+  try {
+    const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/complete`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Key ${process.env.PI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ txid }),
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("[Pi API] 完成支付确认失败:", response.status, errText);
+      return res.status(502).json({ ok: false, error: "Pi 官方 API 完成确认失败", detail: errText });
+    }
+    const payment = await response.json();
+
+    // TODO(数据库联调点): 更新数据库里这笔支付的状态为"已完成",
+    // 并给对应的创作者账户增加积分余额(参考 PRD 里的打赏积分中间层设计)。
+
+    res.json({ ok: true, payment });
+  } catch (err) {
+    console.error("[Pi API] 完成支付确认出错:", err);
+    res.status(500).json({ ok: false, error: "服务端调用 Pi API 出错" });
+  }
+});
+
+
+/* -------------------------------------------------------------------------
    会话接口
    ------------------------------------------------------------------------- */
 
