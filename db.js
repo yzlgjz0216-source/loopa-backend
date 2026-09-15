@@ -59,6 +59,32 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_members_user ON conversation_members(user_id);
+
+  -- 打赏流水表:每一笔打赏的完整记录,从"已批准"到"已完成"的状态变化都留痕
+  -- payment_id 上加唯一约束,防止 Pi SDK 的自动重试导致同一笔打赏被重复入账
+  CREATE TABLE IF NOT EXISTS tips (
+    id TEXT PRIMARY KEY,
+    payment_id TEXT UNIQUE NOT NULL,
+    tx_id TEXT,
+    currency TEXT NOT NULL DEFAULT 'PI',
+    amount REAL NOT NULL,
+    sender_uid TEXT,
+    creator_name TEXT NOT NULL,
+    memo TEXT,
+    status TEXT NOT NULL DEFAULT 'approved' CHECK(status IN ('approved', 'completed', 'failed')),
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER
+  );
+
+  -- 创作者收益汇总表:只存已完成打赏的累计数字,查询主页时不用每次都汇总整张流水表
+  CREATE TABLE IF NOT EXISTS creator_balances (
+    creator_name TEXT PRIMARY KEY,
+    total_pi REAL NOT NULL DEFAULT 0,
+    tip_count INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_tips_creator ON tips(creator_name, status);
 `);
 
 module.exports = db;

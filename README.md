@@ -36,8 +36,9 @@ npm start
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/users` | 创建测试用户 |
-| POST | `/api/payments/approve` | 批准一笔 Pi 支付(需配置 `PI_API_KEY`) |
-| POST | `/api/payments/complete` | 确认一笔 Pi 支付完成(需配置 `PI_API_KEY`) |
+| POST | `/api/payments/approve` | 批准一笔 Pi 支付(需配置 `PI_API_KEY`),批准成功后写入打赏流水表 |
+| POST | `/api/payments/complete` | 确认一笔 Pi 支付完成(需配置 `PI_API_KEY`),完成后更新流水状态并累加创作者收益 |
+| GET | `/api/creators/:name/balance` | 查询某个创作者的累计打赏收益(个人主页"创作者收益"标签用) |
 | GET | `/api/conversations` | 获取当前用户的会话列表 |
 | POST | `/api/conversations/direct` | 创建/获取与某人的私信会话 |
 | POST | `/api/conversations/group` | 创建群聊 |
@@ -58,8 +59,11 @@ Socket.io 事件:
 5. 用 Certbot 给这个子域名签发HTTPS证书
 
 ## 下一步待办
+- [x] 打赏流水表(`tips`)+ 创作者收益汇总(`creator_balances`)已接入,PI打赏在Pi官方确认后会真实入账
 - [ ] 把 `requireAuth` 换成真实的身份验证(接入前端 AuthManager 的登录凭证校验)
 - [ ] 用户量上来后,评估从 SQLite 迁移到 PostgreSQL(表结构已尽量按标准SQL写,迁移成本较低)
 - [ ] 前端聊天界面对接(见 `loopa-mvp` 项目里新增的 Chat 模块)
 - [ ] 群聊的"踢人/退群/管理员权限"等管理功能(当前只有基础建群/拉人)
 - [ ] 消息支持图片/文件(当前 `message_type` 字段已预留,尚未实现上传逻辑)
+- [ ] USDT/USDC打赏接入后,`tips`表的`currency`字段已预留,可直接复用同一张表记录
+- [ ] 切换到Mainnet时:改`app.js`里`sandbox:false` + 换成Mainnet版本的`PI_API_KEY`,数据库和业务逻辑不需要改动

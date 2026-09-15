@@ -104,8 +104,24 @@ app.post("/api/payments/approve", async (req, res) => {
     }
     const payment = await response.json();
 
-    // TODO(数据库联调点): 在这里把这笔待批准的支付记录写入自己的数据库(状态=已批准),
-    // 方便后续对账、以及在 complete 阶段核实这笔支付确实是本平台发起的。
+    // 把这笔"已批准"的打赏写入流水表,payment_id 唯一约束能防止 Pi SDK 自动重试导致重复插入
+    try {
+      db.prepare(`
+        INSERT OR IGNORE INTO tips (id, payment_id, currency, amount, sender_uid, creator_name, memo, status, created_at)
+        VALUES (?, ?, 'PI', ?, ?, ?, ?, 'approved', ?)
+      `).run(
+        uuidv4(),
+        paymentId,
+        payment.amount,
+        payment.user_uid || null,
+        payment.metadata?.creatorId || "unknown",
+        payment.memo || null,
+        Date.now()
+      );
+    } catch (dbErr) {
+      // 数据库写入失败不应该导致整个支付批准失败(Pi那边已经批准了),但必须记日志,方便后续人工核对账目
+      console.error("[Payment] ⚠️ 写入打赏流水表失败(不影响本次支付批准结果):", dbErr);
+    }
 
     res.json({ ok: true, payment });
   } catch (err) {
@@ -139,14 +155,50 @@ app.post("/api/payments/complete", async (req, res) => {
     }
     const payment = await response.json();
 
-    // TODO(数据库联调点): 更新数据库里这笔支付的状态为"已完成",
-    // 并给对应的创作者账户增加积分余额(参考 PRD 里的打赏积分中间层设计)。
+    // 把流水表里这笔记录标记为"已完成",并原子性地累加创作者的收益汇总
+    try {
+      const tx = db.transaction(() => {
+        const tip = db.prepare("SELECT amount, creator_name FROM tips WHERE payment_id = ?").get(paymentId);
+        if (!tip) {
+          // 理论上不应该发生(approve阶段应该已经插入过),但防御性处理一下
+          console.error("[Payment] ⚠️ complete阶段找不到对应的流水记录,paymentId=", paymentId);
+          return;
+        }
+
+        db.prepare(`
+          UPDATE tips SET status = 'completed', tx_id = ?, completed_at = ? WHERE payment_id = ?
+        `).run(txid, Date.now(), paymentId);
+
+        db.prepare(`
+          INSERT INTO creator_balances (creator_name, total_pi, tip_count, updated_at)
+          VALUES (?, ?, 1, ?)
+          ON CONFLICT(creator_name) DO UPDATE SET
+            total_pi = total_pi + excluded.total_pi,
+            tip_count = tip_count + 1,
+            updated_at = excluded.updated_at
+        `).run(tip.creator_name, tip.amount, Date.now());
+      });
+      tx();
+    } catch (dbErr) {
+      // 同上,数据库写入失败不应该让 Pi 那边已经确认完成的支付回滚,但必须留痕方便人工核对补账
+      console.error("[Payment] ⚠️ 更新打赏流水/创作者收益失败(不影响本次支付完成结果):", dbErr);
+    }
 
     res.json({ ok: true, payment });
   } catch (err) {
     console.error("[Pi API] 完成支付确认出错:", err);
     res.status(500).json({ ok: false, error: "服务端调用 Pi API 出错" });
   }
+});
+
+// 查询某个创作者的累计打赏收益(个人主页"创作者收益"标签用)
+app.get("/api/creators/:name/balance", (req, res) => {
+  const { name } = req.params;
+  const balance = db.prepare(
+    "SELECT total_pi, tip_count, updated_at FROM creator_balances WHERE creator_name = ?"
+  ).get(name);
+
+  res.json(balance || { total_pi: 0, tip_count: 0, updated_at: null });
 });
 
 
