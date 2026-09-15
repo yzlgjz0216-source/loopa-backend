@@ -88,6 +88,7 @@ app.post("/api/payments/approve", async (req, res) => {
   const { paymentId } = req.body;
   if (!paymentId) return res.status(400).json({ error: "paymentId 必填" });
   if (!process.env.PI_API_KEY) {
+    console.error("[Payment] ⚠️ PI_API_KEY 未配置或未被读取到,无法调用 Pi 官方 API,批准请求已中止");
     return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
   }
 
@@ -118,6 +119,7 @@ app.post("/api/payments/complete", async (req, res) => {
   const { paymentId, txid } = req.body;
   if (!paymentId || !txid) return res.status(400).json({ error: "paymentId 和 txid 必填" });
   if (!process.env.PI_API_KEY) {
+    console.error("[Payment] ⚠️ PI_API_KEY 未配置或未被读取到,无法调用 Pi 官方 API,完成请求已中止");
     return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
   }
 
@@ -330,4 +332,5 @@ io.on("connection", (socket) => {
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`Loopa 后端服务已启动: http://localhost:${PORT}`);
+  console.log(`PI_API_KEY 是否已正确读取: ${process.env.PI_API_KEY ? "是(长度" + process.env.PI_API_KEY.length + "位)" : "否 —— 未读取到,请检查 .env 文件"}`);
 });
