@@ -22,7 +22,19 @@ const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const db = require("./db");
+
+// Cloudflare R2 是 S3 兼容的对象存储,用同一套 AWS SDK 就能对接,只是换了 endpoint
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: process.env.R2_ACCOUNT_ID ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : undefined,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID || "",
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "",
+  },
+});
 
 const app = express();
 app.use(cors());
@@ -56,16 +68,59 @@ function requireAuth(req, res, next) {
 /* -------------------------------------------------------------------------
    用户接口(测试用,正式版由 AuthManager 的登录流程创建用户)
    ------------------------------------------------------------------------- */
-app.post("/api/users", (req, res) => {
-  const { displayName, avatarUrl } = req.body;
-  if (!displayName) return res.status(400).json({ error: "displayName 必填" });
+/* -------------------------------------------------------------------------
+   账号同步接口:登录成功后,前端立刻调用这个接口,把 Pi/Google/Solana/BNB/
+   手机号这几种登录身份,统一映射/绑定到同一个真实的平台账号(users表)上。
 
-  const id = uuidv4();
-  db.prepare(
-    "INSERT INTO users (id, display_name, avatar_url, created_at) VALUES (?, ?, ?, ?)"
-  ).run(id, displayName, avatarUrl || null, Date.now());
+   ⚠️ 当前简化实现说明:这里直接信任前端传来的 externalId 就当作已验证的身份,
+   跟 requireAuth() 里说的问题一样 —— 正式上线前必须先验证凭证真实性
+   (校验 Pi accessToken / Google credential JWT / 钱包签名),再执行下面的
+   查找或创建逻辑,不能像现在这样直接信任前端说的话。
+   ------------------------------------------------------------------------- */
+const PROVIDER_COLUMN = {
+  pi: "pi_uid",
+  google: "google_sub",
+  solana: "solana_address",
+  bnb: "bnb_address",
+  phone: "phone_number",
+};
 
-  res.json({ id, displayName, avatarUrl });
+app.post("/api/auth/sync", (req, res) => {
+  const { provider, externalId, preferredUsername, avatarUrl, ageTier } = req.body;
+  const column = PROVIDER_COLUMN[provider];
+  if (!column || !externalId) {
+    return res.status(400).json({ error: "provider 和 externalId 必填,provider 需为 pi/google/solana/bnb/phone 之一" });
+  }
+
+  // 先查这个身份是不是已经绑定过账号
+  let user = db.prepare(`SELECT * FROM users WHERE ${column} = ?`).get(externalId);
+
+  if (!user) {
+    // 没有就新建一个账号,username 需要保证唯一,重名了就加个随机后缀
+    const id = uuidv4();
+    let username = (preferredUsername || `pioneer_${externalId.slice(0, 6)}`).toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    const exists = db.prepare("SELECT 1 FROM users WHERE username = ?").get(username);
+    if (exists) username = `${username}_${Math.floor(Math.random() * 9000 + 1000)}`;
+
+    db.prepare(`
+      INSERT INTO users (id, username, display_name, avatar_url, ${column}, age_tier, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, username, preferredUsername || username, avatarUrl || null, externalId, ageTier || null, Date.now());
+
+    user = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+  } else if (ageTier && user.age_tier !== ageTier) {
+    // 年龄分级信息如果有变化(比如首次同步时才拿到),顺手更新一下
+    db.prepare("UPDATE users SET age_tier = ? WHERE id = ?").run(ageTier, user.id);
+    user.age_tier = ageTier;
+  }
+
+  res.json({
+    id: user.id,
+    username: user.username,
+    displayName: user.display_name,
+    avatarUrl: user.avatar_url,
+    ageTier: user.age_tier,
+  });
 });
 
 
@@ -199,6 +254,90 @@ app.get("/api/creators/:name/balance", (req, res) => {
   ).get(name);
 
   res.json(balance || { total_pi: 0, tip_count: 0, updated_at: null });
+});
+
+
+/* -------------------------------------------------------------------------
+   视频上传与Feed接口
+
+   上传流程采用"预签名直传"模式,不是把视频文件流经我们自己的服务器:
+   1) 前端先调用 /api/videos/upload-url,拿到一个有时效性的R2直传地址
+   2) 前端浏览器直接把视频文件 PUT 到这个地址(不经过我们的Node服务器)
+   3) 上传完成后,前端再调用 /api/videos 把这条视频的信息(标题、地址等)存进数据库
+
+   这样设计是因为我们的服务器配置很小(1核1GB),视频文件如果先经过它再转存,
+   既占内存又占带宽,直传能完全绕开这个瓶颈,是视频类应用的标准做法。
+   ------------------------------------------------------------------------- */
+
+app.post("/api/videos/upload-url", async (req, res) => {
+  const { filename, contentType } = req.body;
+  if (!filename || !contentType) {
+    return res.status(400).json({ error: "filename 和 contentType 必填" });
+  }
+  if (!process.env.R2_BUCKET_NAME || !process.env.R2_ACCOUNT_ID) {
+    return res.status(500).json({ error: "服务端未配置 R2 存储,无法生成上传地址,请检查 .env" });
+  }
+
+  const videoId = uuidv4();
+  const objectKey = `videos/${videoId}-${filename.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+
+  try {
+    const command = new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: objectKey,
+      ContentType: contentType,
+    });
+    const uploadUrl = await getSignedUrl(r2, command, { expiresIn: 600 }); // 10分钟内有效
+
+    const publicUrl = `${process.env.R2_PUBLIC_URL}/${objectKey}`;
+
+    res.json({ videoId, uploadUrl, publicUrl });
+  } catch (err) {
+    console.error("[R2] 生成预签名上传地址失败:", err);
+    res.status(500).json({ error: "生成上传地址失败" });
+  }
+});
+
+app.post("/api/videos", (req, res) => {
+  const { videoId, creatorId, creatorName, caption, videoUrl, thumbnailUrl } = req.body;
+  if (!videoId || !creatorId || !creatorName || !videoUrl) {
+    return res.status(400).json({ error: "videoId、creatorId、creatorName、videoUrl 均为必填" });
+  }
+
+  db.prepare(`
+    INSERT INTO videos (id, creator_id, creator_name, caption, video_url, thumbnail_url, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'published', ?)
+  `).run(videoId, creatorId, creatorName, caption || "", videoUrl, thumbnailUrl || null, Date.now());
+
+  res.json({ ok: true, videoId });
+});
+
+// Feed流:按发布时间倒序,支持简单分页
+app.get("/api/videos/feed", (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 20, 50);
+  const before = Number(req.query.before) || Date.now();
+
+  const videos = db.prepare(`
+    SELECT id, creator_id, creator_name, caption, video_url, thumbnail_url, view_count, like_count, created_at
+    FROM videos
+    WHERE status = 'published' AND created_at < ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(before, limit);
+
+  res.json(videos);
+});
+
+// 某个创作者自己发布过的作品(个人主页"作品"标签用)
+app.get("/api/videos/user/:creatorId", (req, res) => {
+  const videos = db.prepare(`
+    SELECT id, caption, video_url, thumbnail_url, view_count, like_count, created_at
+    FROM videos
+    WHERE creator_id = ? AND status = 'published'
+    ORDER BY created_at DESC
+  `).all(req.params.creatorId);
+
+  res.json(videos);
 });
 
 

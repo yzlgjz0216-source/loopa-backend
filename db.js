@@ -12,13 +12,19 @@ const db = new Database(path.join(__dirname, "loopa.db"));
 db.pragma("journal_mode = WAL"); // 提升并发读写性能
 
 db.exec(`
-  -- 用户表(简化版,先用于跑通聊天功能;
-  -- 正式版需要和前端的 AuthManager 多登录体系打通,把 pi_uid / google_sub /
-  -- solana_address / phone_number 这些身份标识都关联到这里的 user_id)
+  -- 用户表:真正的账号体系,登录时会把 Pi/Google/Solana/BNB/手机号 这几种身份
+  -- 都统一映射到这里的同一个 user_id,username 是对外展示的创作者/@handle
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
     display_name TEXT NOT NULL,
     avatar_url TEXT,
+    pi_uid TEXT UNIQUE,
+    google_sub TEXT UNIQUE,
+    solana_address TEXT UNIQUE,
+    bnb_address TEXT UNIQUE,
+    phone_number TEXT UNIQUE,
+    age_tier TEXT,
     created_at INTEGER NOT NULL
   );
 
@@ -85,6 +91,43 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_tips_creator ON tips(creator_name, status);
+
+  -- 视频表:真实的内容发布记录
+  CREATE TABLE IF NOT EXISTS videos (
+    id TEXT PRIMARY KEY,
+    creator_id TEXT NOT NULL,
+    creator_name TEXT NOT NULL,   -- 冗余存一份用户名,渲染Feed时不用每次JOIN users表
+    caption TEXT,
+    video_url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    view_count INTEGER NOT NULL DEFAULT 0,
+    like_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'published' CHECK(status IN ('processing', 'published', 'removed')),
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (creator_id) REFERENCES users(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_videos_feed ON videos(status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_videos_creator ON videos(creator_id, created_at);
 `);
+
+// 兼容性迁移:如果是从旧版本升级上来的数据库,users表可能缺少这些新增字段,
+// 逐个尝试添加,已存在的字段会报错但不影响其他字段继续添加(用 try/catch 逐条忽略)
+const userMigrationColumns = [
+  "username TEXT",
+  "pi_uid TEXT",
+  "google_sub TEXT",
+  "solana_address TEXT",
+  "bnb_address TEXT",
+  "phone_number TEXT",
+  "age_tier TEXT",
+];
+for (const col of userMigrationColumns) {
+  try {
+    db.exec(`ALTER TABLE users ADD COLUMN ${col}`);
+  } catch (e) {
+    // 字段已存在时会报错,属于正常情况,忽略即可
+  }
+}
 
 module.exports = db;
