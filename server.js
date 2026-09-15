@@ -28,6 +28,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// 临时诊断用:记录所有到达服务器的请求,排查完连通性问题后可以删掉这几行
+app.use((req, res, next) => {
+  console.log(`[请求日志] ${req.method} ${req.path}`);
+  next();
+});
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } }); // 生产环境请把 origin 改成你的真实前端域名
 
@@ -78,6 +84,7 @@ app.post("/api/users", (req, res) => {
 const PI_API_BASE = "https://api.minepi.com/v2";
 
 app.post("/api/payments/approve", async (req, res) => {
+  console.log("[Payment] 收到批准请求,paymentId=", req.body?.paymentId, " 完整body=", JSON.stringify(req.body));
   const { paymentId } = req.body;
   if (!paymentId) return res.status(400).json({ error: "paymentId 必填" });
   if (!process.env.PI_API_KEY) {
@@ -107,6 +114,7 @@ app.post("/api/payments/approve", async (req, res) => {
 });
 
 app.post("/api/payments/complete", async (req, res) => {
+  console.log("[Payment] 收到完成请求,paymentId=", req.body?.paymentId, " txid=", req.body?.txid);
   const { paymentId, txid } = req.body;
   if (!paymentId || !txid) return res.status(400).json({ error: "paymentId 和 txid 必填" });
   if (!process.env.PI_API_KEY) {
