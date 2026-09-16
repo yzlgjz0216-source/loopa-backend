@@ -49,7 +49,6 @@ app.use((req, res, next) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } }); // 生产环境请把 origin 改成你的真实前端域名
 
-
 /* -------------------------------------------------------------------------
    身份验证中间件(占位版,见文件头警告)
    ------------------------------------------------------------------------- */
@@ -63,7 +62,6 @@ function requireAuth(req, res, next) {
   req.userId = userId;
   next();
 }
-
 
 /* -------------------------------------------------------------------------
    用户接口(测试用,正式版由 AuthManager 的登录流程创建用户)
@@ -120,9 +118,9 @@ app.post("/api/auth/sync", (req, res) => {
     displayName: user.display_name,
     avatarUrl: user.avatar_url,
     ageTier: user.age_tier,
+    bio: user.bio || "",
   });
 });
-
 
 /* -------------------------------------------------------------------------
    Pi 支付接口:真正对接 Pi 官方服务端 API,完成 U2A 支付的"批准"和"完成"两步。
@@ -256,7 +254,6 @@ app.get("/api/creators/:name/balance", (req, res) => {
   res.json(balance || { total_pi: 0, tip_count: 0, updated_at: null });
 });
 
-
 /* -------------------------------------------------------------------------
    视频上传与Feed接口
 
@@ -312,13 +309,14 @@ app.post("/api/videos", (req, res) => {
   res.json({ ok: true, videoId });
 });
 
-// Feed流:按发布时间倒序,支持简单分页
+// Feed流:按发布时间倒序,支持简单分页;顺带用子查询带出评论数,前端不用再单独请求
 app.get("/api/videos/feed", (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 50);
   const before = Number(req.query.before) || Date.now();
 
   const videos = db.prepare(`
-    SELECT id, creator_id, creator_name, caption, video_url, thumbnail_url, view_count, like_count, created_at
+    SELECT id, creator_id, creator_name, caption, video_url, thumbnail_url, view_count, like_count, created_at,
+           (SELECT COUNT(*) FROM comments WHERE video_id = videos.id) AS comment_count
     FROM videos
     WHERE status = 'published' AND created_at < ?
     ORDER BY created_at DESC
@@ -331,7 +329,8 @@ app.get("/api/videos/feed", (req, res) => {
 // 某个创作者自己发布过的作品(个人主页"作品"标签用)
 app.get("/api/videos/user/:creatorId", (req, res) => {
   const videos = db.prepare(`
-    SELECT id, caption, video_url, thumbnail_url, view_count, like_count, created_at
+    SELECT id, caption, video_url, thumbnail_url, view_count, like_count, created_at,
+           (SELECT COUNT(*) FROM comments WHERE video_id = videos.id) AS comment_count
     FROM videos
     WHERE creator_id = ? AND status = 'published'
     ORDER BY created_at DESC
@@ -340,6 +339,121 @@ app.get("/api/videos/user/:creatorId", (req, res) => {
   res.json(videos);
 });
 
+/* -------------------------------------------------------------------------
+   点赞接口:切换点赞状态(已点过再点一次就是取消),同步维护 videos.like_count
+   这个冗余计数字段,避免Feed每次渲染都要对 likes 表做 COUNT 聚合查询。
+
+   ⚠️ 跟视频/支付接口一样,当前直接信任前端传来的 x-user-id,没有做真实身份校验,
+   正式上线前需要跟 requireAuth() 一起补上真实的身份验证逻辑。
+   ------------------------------------------------------------------------- */
+app.post("/api/videos/:id/like", (req, res) => {
+  const { id: videoId } = req.params;
+  const userId = req.headers["x-user-id"] || req.body.userId;
+  if (!userId) return res.status(400).json({ error: "缺少用户身份(x-user-id)" });
+
+  const video = db.prepare("SELECT id, like_count FROM videos WHERE id = ?").get(videoId);
+  if (!video) return res.status(404).json({ error: "视频不存在" });
+
+  const existing = db.prepare("SELECT 1 FROM likes WHERE video_id = ? AND user_id = ?").get(videoId, userId);
+
+  const tx = db.transaction(() => {
+    if (existing) {
+      db.prepare("DELETE FROM likes WHERE video_id = ? AND user_id = ?").run(videoId, userId);
+      db.prepare("UPDATE videos SET like_count = MAX(like_count - 1, 0) WHERE id = ?").run(videoId);
+    } else {
+      db.prepare("INSERT INTO likes (video_id, user_id, created_at) VALUES (?, ?, ?)").run(videoId, userId, Date.now());
+      db.prepare("UPDATE videos SET like_count = like_count + 1 WHERE id = ?").run(videoId);
+    }
+  });
+  tx();
+
+  const updated = db.prepare("SELECT like_count FROM videos WHERE id = ?").get(videoId);
+  res.json({ liked: !existing, likeCount: updated.like_count });
+});
+
+// 某个用户点过赞的视频id列表(Feed渲染时用,标记哪些心形图标要显示成"已点赞"状态)
+app.get("/api/users/:userId/likes", (req, res) => {
+  const rows = db.prepare("SELECT video_id FROM likes WHERE user_id = ?").all(req.params.userId);
+  res.json(rows.map((r) => r.video_id));
+});
+
+/* -------------------------------------------------------------------------
+   关注接口:切换关注状态
+   ------------------------------------------------------------------------- */
+app.post("/api/users/:id/follow", (req, res) => {
+  const creatorId = req.params.id;
+  const followerId = req.headers["x-user-id"] || req.body.userId;
+  if (!followerId) return res.status(400).json({ error: "缺少用户身份(x-user-id)" });
+  if (followerId === creatorId) return res.status(400).json({ error: "不能关注自己" });
+
+  const existing = db.prepare("SELECT 1 FROM follows WHERE follower_id = ? AND creator_id = ?").get(followerId, creatorId);
+
+  if (existing) {
+    db.prepare("DELETE FROM follows WHERE follower_id = ? AND creator_id = ?").run(followerId, creatorId);
+  } else {
+    db.prepare("INSERT INTO follows (follower_id, creator_id, created_at) VALUES (?, ?, ?)").run(followerId, creatorId, Date.now());
+  }
+
+  const followerCount = db.prepare("SELECT COUNT(*) AS c FROM follows WHERE creator_id = ?").get(creatorId).c;
+  res.json({ following: !existing, followerCount });
+});
+
+// 某个用户关注了哪些创作者(Feed渲染时用,标记哪些关注按钮要显示成"已关注"状态)
+app.get("/api/users/:userId/following", (req, res) => {
+  const rows = db.prepare("SELECT creator_id FROM follows WHERE follower_id = ?").all(req.params.userId);
+  res.json(rows.map((r) => r.creator_id));
+});
+
+/* -------------------------------------------------------------------------
+   评论接口
+   ------------------------------------------------------------------------- */
+app.get("/api/videos/:id/comments", (req, res) => {
+  const comments = db.prepare(`
+    SELECT id, user_id, username, content, created_at
+    FROM comments WHERE video_id = ? ORDER BY created_at ASC
+  `).all(req.params.id);
+  res.json(comments);
+});
+
+app.post("/api/videos/:id/comments", (req, res) => {
+  const { userId, username, content } = req.body;
+  if (!userId || !username || !content || !content.trim()) {
+    return res.status(400).json({ error: "userId、username、content 均为必填" });
+  }
+  const video = db.prepare("SELECT id FROM videos WHERE id = ?").get(req.params.id);
+  if (!video) return res.status(404).json({ error: "视频不存在" });
+
+  const comment = {
+    id: uuidv4(),
+    video_id: req.params.id,
+    user_id: userId,
+    username,
+    content: content.trim().slice(0, 500),
+    created_at: Date.now(),
+  };
+  db.prepare(`
+    INSERT INTO comments (id, video_id, user_id, username, content, created_at)
+    VALUES (@id, @video_id, @user_id, @username, @content, @created_at)
+  `).run(comment);
+
+  res.json(comment);
+});
+
+/* -------------------------------------------------------------------------
+   个人资料编辑接口
+   ------------------------------------------------------------------------- */
+app.patch("/api/users/:id", (req, res) => {
+  const { displayName, bio } = req.body;
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.params.id);
+  if (!user) return res.status(404).json({ error: "用户不存在" });
+
+  const nextDisplayName = (displayName || "").trim().slice(0, 40) || user.display_name;
+  const nextBio = (bio || "").trim().slice(0, 200);
+
+  db.prepare("UPDATE users SET display_name = ?, bio = ? WHERE id = ?").run(nextDisplayName, nextBio, req.params.id);
+  const updated = db.prepare("SELECT id, username, display_name, avatar_url, bio FROM users WHERE id = ?").get(req.params.id);
+  res.json(updated);
+});
 
 /* -------------------------------------------------------------------------
    会话接口
@@ -452,7 +566,6 @@ app.post("/api/conversations/:id/read", requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-
 /* -------------------------------------------------------------------------
    Socket.io 实时消息推送
    ------------------------------------------------------------------------- */
@@ -518,7 +631,6 @@ io.on("connection", (socket) => {
     // 预留:可在这里做"最后在线时间"更新等逻辑
   });
 });
-
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
