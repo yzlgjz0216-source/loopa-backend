@@ -1,5 +1,5 @@
 /* =========================================================================
-   server.js — Loopa 私信/群聊后端服务(MVP)
+   server.js — Ownlo 私信/群聊后端服务(MVP)
 
    本地运行方式:
      1) cd loopa-backend
@@ -522,6 +522,6 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
-  console.log(`Loopa 后端服务已启动: http://localhost:${PORT}`);
+  console.log(`Ownlo 后端服务已启动: http://localhost:${PORT}`);
   console.log(`PI_API_KEY 是否已正确读取: ${process.env.PI_API_KEY ? "是(长度" + process.env.PI_API_KEY.length + "位)" : "否 —— 未读取到,请检查 .env 文件"}`);
 });

@@ -1,7 +1,7 @@
 {
-  "name": "loopa-backend",
+  "name": "ownlo-backend",
   "version": "0.1.0",
-  "description": "Loopa 私信/群聊后端服务(MVP阶段)",
+  "description": "Ownlo 私信/群聊后端服务(MVP阶段)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
