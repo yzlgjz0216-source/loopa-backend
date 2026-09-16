@@ -109,6 +109,43 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_videos_feed ON videos(status, created_at);
   CREATE INDEX IF NOT EXISTS idx_videos_creator ON videos(creator_id, created_at);
+
+  -- 点赞表:一个用户对同一个视频最多点一次赞,(video_id, user_id) 联合主键天然防止重复点赞
+  CREATE TABLE IF NOT EXISTS likes (
+    video_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (video_id, user_id),
+    FOREIGN KEY (video_id) REFERENCES videos(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  -- 关注关系表:follower_id 关注了 creator_id
+  CREATE TABLE IF NOT EXISTS follows (
+    follower_id TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (follower_id, creator_id),
+    FOREIGN KEY (follower_id) REFERENCES users(id),
+    FOREIGN KEY (creator_id) REFERENCES users(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_follows_creator ON follows(creator_id);
+  CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
+
+  -- 评论表
+  CREATE TABLE IF NOT EXISTS comments (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (video_id) REFERENCES videos(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(video_id, created_at);
 `);
 
 // 兼容性迁移:如果是从旧版本升级上来的数据库,users表可能缺少这些新增字段,
@@ -121,6 +158,7 @@ const userMigrationColumns = [
   "bnb_address TEXT",
   "phone_number TEXT",
   "age_tier TEXT",
+  "bio TEXT",
 ];
 for (const col of userMigrationColumns) {
   try {
