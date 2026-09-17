@@ -966,21 +966,32 @@ app.get("/api/videos/feed", optionalAuth, (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 50);
   const before = Number(req.query.before) || Date.now();
 
+  // 本轮修复:v.creator_name 只是发布视频那一刻的用户名快照,改资料(改昵称/传头像)
+  // 之后永远不会再更新,Feed 卡片一直显示的是最初注册时的旧名字,而且原来这里压根
+  // 没有查头像字段——所以头像格子一直是空的。这里改成 LEFT JOIN users 表,取创作者
+  // "此刻"真实的昵称和头像(LEFT JOIN 是为了防止创作者账号被删掉后这条视频从 Feed 里
+  // 整个消失,这种情况下 creator_display_name/creator_avatar_url 就是 null,前端会自动
+  // 回退到旧的 creator_name)。
   const videos = req.userId
     ? db.prepare(`
         SELECT v.id, v.creator_id, v.creator_name, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
+               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
                (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
         FROM videos v
+        LEFT JOIN users u ON u.id = v.creator_id
         WHERE v.status = 'published' AND v.created_at < ?
           AND v.creator_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
           AND v.creator_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
         ORDER BY v.created_at DESC LIMIT ?
       `).all(before, req.userId, req.userId, limit)
     : db.prepare(`
-        SELECT id, creator_id, creator_name, caption, video_url, thumbnail_url, view_count, like_count, created_at,
-               (SELECT COUNT(*) FROM comments WHERE video_id = videos.id) AS comment_count
-        FROM videos WHERE status = 'published' AND created_at < ?
-        ORDER BY created_at DESC LIMIT ?
+        SELECT v.id, v.creator_id, v.creator_name, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
+               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+               (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
+        FROM videos v
+        LEFT JOIN users u ON u.id = v.creator_id
+        WHERE v.status = 'published' AND v.created_at < ?
+        ORDER BY v.created_at DESC LIMIT ?
       `).all(before, limit);
 
   res.json(videos);
@@ -1140,6 +1151,16 @@ app.post("/api/videos/:id/comments", requireAuth, commentLimiter, (req, res) => 
 /* =========================================================================
    个人资料
    ========================================================================= */
+// 查看任意用户的公开资料(本轮新增)——之前完全没有"按 id 查询他人资料"的接口,
+// 只有修改"自己"资料的 PATCH。导致点开别人主页时("访客模式"),前端连问都没地方问,
+// 只能一直显示占位头像和 Feed 卡片里可能已经过期的旧昵称,改了资料对方也看不到更新。
+// 不要求登录(和查看别人的公开作品一样,谁都能看),只返回公开字段。
+app.get("/api/users/:id", (req, res) => {
+  const user = db.prepare("SELECT id, username, display_name, avatar_url, background_url, age_tier, bio FROM users WHERE id = ?").get(req.params.id);
+  if (!user) return res.status(404).json({ error: "用户不存在" });
+  res.json(publicUserView(user));
+});
+
 app.patch("/api/users/:id", requireAuth, (req, res) => {
   if (req.params.id !== req.userId) return res.status(403).json({ error: "只能修改自己的资料" });
   // 本轮新增 avatarUrl/backgroundUrl:两者都只接受本站 R2 公开域名下的地址
