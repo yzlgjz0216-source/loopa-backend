@@ -150,8 +150,18 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_tips_creator ON tips(creator_name, status);
-  CREATE INDEX IF NOT EXISTS idx_tips_creator_user ON tips(creator_user_id, status);
-  CREATE INDEX IF NOT EXISTS idx_tips_buyer ON tips(buyer_user_id);
+  -- ⚠️ 注意:idx_tips_creator_user / idx_tips_buyer 这两个索引依赖
+  -- creator_user_id / buyer_user_id 这两个"本轮新增"的字段。对于全新数据库,
+  -- 上面 CREATE TABLE 已经把这两个字段建好了,这里建索引没问题;但对于
+  -- "已经在跑的旧生产数据库"(tips 表早就存在,没有这两个字段),
+  -- CREATE TABLE IF NOT EXISTS 在这种情况下是空操作,不会补上缺的字段,
+  -- 而这两个字段是靠下面第322行附近的 tipsMigrationColumns 迁移循环
+  -- (ALTER TABLE tips ADD COLUMN ...)在稍后才补上的 —— 时间顺序上,
+  -- 如果把这两条建索引语句留在这里(和 CREATE TABLE 同一个 db.exec 调用里),
+  -- 会比字段迁移更早执行,导致 "SqliteError: no such column: creator_user_id"
+  -- 这样的启动崩溃(2026-09 生产环境实际出现过的故障,现已移到迁移循环之后,
+  -- 见下方 tipsMigrationColumns 循环结束后的 idx_tips_creator_user /
+  -- idx_tips_buyer 建索引代码)。
 
   -- 视频表:真实的内容发布记录
   -- status 新增 'pending_review'(见 server.js 的 REQUIRE_VIDEO_REVIEW 开关):
@@ -329,6 +339,26 @@ for (const col of tipsMigrationColumns) {
       console.error(`[db migration] tips 表添加字段 "${col}" 失败:`, e.message);
     }
   }
+}
+
+// ⚠️ 关键修复(2026-09 生产环境崩溃复盘):这两个索引依赖的
+// creator_user_id / buyer_user_id 字段,必须等上面的迁移循环把字段真正
+// 加到(可能是旧版本的)tips 表之后,才能建索引 —— 所以特意放在这里,
+// 而不是放进最上面那个和 CREATE TABLE 挨在一起的大 db.exec() 里。
+// 之前的版本把这两条语句写在了 CREATE TABLE 同一个 exec 调用里,对全新
+// 数据库没问题,但对已经存在旧版 tips 表(缺这两个字段)的生产数据库,
+// CREATE TABLE IF NOT EXISTS 是空操作、不会补字段,导致这两条建索引语句
+// 在字段还不存在时就执行,抛出 "SqliteError: no such column: creator_user_id"
+// 并让服务在启动阶段直接崩溃重启死循环。
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tips_creator_user ON tips(creator_user_id, status)`);
+} catch (e) {
+  console.error(`[db migration] 建立索引 idx_tips_creator_user 失败:`, e.message);
+}
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tips_buyer ON tips(buyer_user_id)`);
+} catch (e) {
+  console.error(`[db migration] 建立索引 idx_tips_buyer 失败:`, e.message);
 }
 
 // messages 表的软删除字段
