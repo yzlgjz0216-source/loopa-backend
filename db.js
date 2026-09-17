@@ -12,8 +12,10 @@ const db = new Database(path.join(__dirname, "loopa.db"));
 db.pragma("journal_mode = WAL"); // 提升并发读写性能
 
 db.exec(`
-  -- 用户表:真正的账号体系,登录时会把 Pi/Google/Solana/BNB/手机号 这几种身份
-  -- 都统一映射到这里的同一个 user_id,username 是对外展示的创作者/@handle
+  -- 用户表:真正的账号体系,登录时会把 Pi/Google/Solana/BNB/手机号/邮箱 这几种身份
+  -- 都统一映射到这里的同一个 user_id,username 是对外展示的创作者/@handle。
+  -- email 是这一轮新加的:配合"账号绑定"功能,让 Pi 用户离开 Pi Browser 后,
+  -- 依然可以用绑定过的邮箱/手机号/其他钱包登录回同一个账号。
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT UNIQUE NOT NULL,
@@ -24,6 +26,7 @@ db.exec(`
     solana_address TEXT UNIQUE,
     bnb_address TEXT UNIQUE,
     phone_number TEXT UNIQUE,
+    email TEXT UNIQUE,
     age_tier TEXT,
     created_at INTEGER NOT NULL
   );
@@ -149,7 +152,10 @@ db.exec(`
 `);
 
 // 兼容性迁移:如果是从旧版本升级上来的数据库,users表可能缺少这些新增字段,
-// 逐个尝试添加,已存在的字段会报错但不影响其他字段继续添加(用 try/catch 逐条忽略)
+// 逐个尝试添加,已存在的字段会报错但不影响其他字段继续添加(用 try/catch 逐条忽略)。
+// 注意:SQLite 的 ALTER TABLE ADD COLUMN 不支持直接带 UNIQUE 约束,
+// 所以这里加进来的字段(包括这次新增的 email)唯一性检查要靠应用层在
+// /api/auth/sync 和 /api/auth/bind 里写入前先查一遍,不能只依赖数据库约束。
 const userMigrationColumns = [
   "username TEXT",
   "pi_uid TEXT",
@@ -157,6 +163,7 @@ const userMigrationColumns = [
   "solana_address TEXT",
   "bnb_address TEXT",
   "phone_number TEXT",
+  "email TEXT",
   "age_tier TEXT",
   "bio TEXT",
 ];

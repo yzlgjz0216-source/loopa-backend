@@ -123,6 +123,90 @@ app.post("/api/auth/sync", (req, res) => {
 });
 
 /* -------------------------------------------------------------------------
+   账号绑定接口(本轮新增):多身份绑定架构
+
+   背景:/api/auth/sync 只解决"用某一种身份登录/自动建号"的问题,一个账号
+   一旦用 Pi 身份创建,以前没有办法再让"已经登录的这个账号"追加绑定第二种
+   登录方式(比如邮箱、Google、其他钱包)。这次要解决的正是这个问题 ——
+   目的是让 Pi Browser 里的用户,能提前把邮箱/手机号(以及有条件的话,
+   Google/Solana/BNB)绑定到同一个账号上,这样将来 Ownlo 独立 App 上线后,
+   这些用户不需要在 Pi Browser 之外"重新注册一个新账号",可以直接用绑定过
+   的邮箱/手机号登录回同一个身份、同一份数据。
+
+   BIND_PROVIDER_COLUMN 比登录用的 PROVIDER_COLUMN 多一个 email,因为
+   "绑定邮箱"是这次新加的需求,登录(sync)阶段暂时还不支持直接用邮箱登录
+   (那是另一个功能,这次先做"绑定"这一半)。
+
+   ⚠️ 和 /api/auth/sync 一样,这里的 externalId 目前也是直接信任前端传来的
+   值,没有做真实凭证校验(没有真的发验证码/校验 Google JWT/验证钱包签名)。
+   这是本轮为了先把绑定架构和数据模型跑通而做的简化,上线前必须补上真实的
+   凭证验证逻辑,否则任何人都能拿别人的邮箱/手机号往自己账号上绑。前端那边
+   已经按"仅在能拿到真实凭证时才允许绑定"做了限制(见 app.js 里 GoogleAuth/
+   SolanaAuth/BNBAuth 的 getProvider() 检查),但后端也不应该只依赖前端的
+   自觉,这一点已经在交付说明里明确告知,留给下一轮或人工审查处理。
+   ------------------------------------------------------------------------- */
+const BIND_PROVIDER_COLUMN = {
+  pi: "pi_uid",
+  google: "google_sub",
+  solana: "solana_address",
+  bnb: "bnb_address",
+  phone: "phone_number",
+  email: "email",
+};
+
+// 给已登录账号(x-user-id)追加绑定一种新的身份
+app.post("/api/auth/bind", requireAuth, (req, res) => {
+  const { provider, externalId } = req.body;
+  const column = BIND_PROVIDER_COLUMN[provider];
+  if (!column || !externalId || !String(externalId).trim()) {
+    return res.status(400).json({ error: "provider 和 externalId 必填,provider 需为 pi/google/solana/bnb/phone/email 之一" });
+  }
+  const normalizedId = String(externalId).trim();
+
+  // 查一下这个身份是不是已经被(别的)账号占用了
+  const existingOwner = db.prepare(`SELECT id FROM users WHERE ${column} = ?`).get(normalizedId);
+
+  if (existingOwner && existingOwner.id !== req.userId) {
+    // 被别的账号占用,不能绑 —— 这是防止"我把别人已经绑定过的邮箱/钱包地址绑到自己账号上"
+    return res.status(409).json({ error: "这个身份已经绑定在另一个 Ownlo 账号上了,不能重复绑定" });
+  }
+
+  if (existingOwner && existingOwner.id === req.userId) {
+    // 已经绑定在自己账号上了,视为成功(幂等),不用重复写库
+    const bindings = getBindingsForUser(req.userId);
+    return res.json({ ok: true, alreadyBound: true, bindings });
+  }
+
+  db.prepare(`UPDATE users SET ${column} = ? WHERE id = ?`).run(normalizedId, req.userId);
+
+  const bindings = getBindingsForUser(req.userId);
+  res.json({ ok: true, alreadyBound: false, bindings });
+});
+
+// 查询某个账号目前绑定了哪些身份 —— 只返回布尔值,不返回具体的邮箱/手机号/钱包地址原文,
+// 避免"个人页面查询接口"变相成为一个可以扒到别人联系方式/钱包地址的信息泄露口子。
+app.get("/api/users/:id/bindings", (req, res) => {
+  const user = db.prepare("SELECT id FROM users WHERE id = ?").get(req.params.id);
+  if (!user) return res.status(404).json({ error: "用户不存在" });
+  res.json(getBindingsForUser(req.params.id));
+});
+
+function getBindingsForUser(userId) {
+  const row = db.prepare(
+    "SELECT pi_uid, google_sub, solana_address, bnb_address, phone_number, email FROM users WHERE id = ?"
+  ).get(userId);
+  if (!row) return { pi: false, google: false, solana: false, bnb: false, phone: false, email: false };
+  return {
+    pi: !!row.pi_uid,
+    google: !!row.google_sub,
+    solana: !!row.solana_address,
+    bnb: !!row.bnb_address,
+    phone: !!row.phone_number,
+    email: !!row.email,
+  };
+}
+
+/* -------------------------------------------------------------------------
    Pi 支付接口:真正对接 Pi 官方服务端 API,完成 U2A 支付的"批准"和"完成"两步。
 
    ⚠️ 这两个接口是 Pi 支付流程里"必须由服务端完成"的关键环节,不能省略:
