@@ -318,6 +318,7 @@ const userMigrationColumns = [
   "email TEXT",
   "age_tier TEXT",
   "bio TEXT",
+  "background_url TEXT", // 本轮新增:个人资料背景图,和已有的 avatar_url 同样是可为空的展示字段
 ];
 for (const col of userMigrationColumns) {
   try {

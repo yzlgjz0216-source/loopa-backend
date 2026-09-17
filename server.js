@@ -76,7 +76,7 @@ const http = require("http");
 const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
 const rateLimit = require("express-rate-limit");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const db = require("./db");
 
@@ -388,6 +388,7 @@ function publicUserView(user) {
     username: user.username,
     displayName: user.display_name,
     avatarUrl: user.avatar_url,
+    backgroundUrl: user.background_url, // 本轮新增:个人资料背景图
     ageTier: user.age_tier,
     bio: user.bio || "",
   };
@@ -985,9 +986,41 @@ app.get("/api/videos/feed", optionalAuth, (req, res) => {
   res.json(videos);
 });
 
+// 删除自己发布的视频(本轮新增:此前只能上传,没有删除入口)。
+// 只允许作者本人删除,同时清理掉这条视频关联的点赞/评论记录,避免留下指向
+// 已删除视频的孤儿数据;R2 上的实际文件也尽量一并删除,但即使 R2 删除失败
+// (比如那一刻对象存储抖动)也不影响数据库记录被删除——不能因为清理云存储
+// 失败就让用户没法删除自己的作品。
+app.delete("/api/videos/:id", requireAuth, async (req, res) => {
+  const video = db.prepare("SELECT * FROM videos WHERE id = ?").get(req.params.id);
+  if (!video) return res.status(404).json({ error: "视频不存在或已被删除" });
+  if (video.creator_id !== req.userId) return res.status(403).json({ error: "只能删除自己发布的作品" });
+
+  const deleteMany = db.transaction(() => {
+    db.prepare("DELETE FROM comments WHERE video_id = ?").run(video.id);
+    db.prepare("DELETE FROM likes WHERE video_id = ?").run(video.id);
+    db.prepare("DELETE FROM videos WHERE id = ?").run(video.id);
+  });
+  deleteMany();
+
+  const r2PublicUrl = process.env.R2_PUBLIC_URL || "";
+  if (r2PublicUrl && video.video_url && video.video_url.startsWith(`${r2PublicUrl}/`)) {
+    const objectKey = video.video_url.slice(r2PublicUrl.length + 1);
+    try {
+      await r2.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: objectKey }));
+    } catch (err) {
+      console.error("[R2] 删除视频对象失败(数据库记录已删除,不影响本次请求结果):", err.message);
+    }
+  }
+
+  res.json({ ok: true });
+});
+
 app.get("/api/videos/user/:creatorId", (req, res) => {
+  // creator_id 本轮补进返回字段:前端"作品"弹层需要靠它判断当前浏览的是不是
+  // 自己的作品,来决定要不要显示删除按钮——之前这里没有返回这个字段。
   const videos = db.prepare(`
-    SELECT id, caption, video_url, thumbnail_url, view_count, like_count, created_at,
+    SELECT id, creator_id, caption, video_url, thumbnail_url, view_count, like_count, created_at,
            (SELECT COUNT(*) FROM comments WHERE video_id = videos.id) AS comment_count
     FROM videos WHERE creator_id = ? AND status = 'published'
     ORDER BY created_at DESC
@@ -1109,16 +1142,53 @@ app.post("/api/videos/:id/comments", requireAuth, commentLimiter, (req, res) => 
    ========================================================================= */
 app.patch("/api/users/:id", requireAuth, (req, res) => {
   if (req.params.id !== req.userId) return res.status(403).json({ error: "只能修改自己的资料" });
-  const { displayName, bio } = req.body;
+  // 本轮新增 avatarUrl/backgroundUrl:两者都只接受本站 R2 公开域名下的地址
+  // (见下面 /api/users/me/image-upload-url),不接受任意外部 URL,避免被用来
+  // 拼接一个跳转到钓鱼页面/加载不可控内容的链接。
+  const { displayName, bio, avatarUrl, backgroundUrl } = req.body;
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.params.id);
   if (!user) return res.status(404).json({ error: "用户不存在" });
 
   const nextDisplayName = (displayName || "").trim().slice(0, 40) || user.display_name;
   const nextBio = (bio || "").trim().slice(0, 200);
+  const r2PublicUrl = process.env.R2_PUBLIC_URL || "";
+  const isValidR2Url = (url) => typeof url === "string" && r2PublicUrl && url.startsWith(`${r2PublicUrl}/`);
+  const nextAvatarUrl = avatarUrl !== undefined
+    ? (isValidR2Url(avatarUrl) ? avatarUrl : user.avatar_url)
+    : user.avatar_url;
+  const nextBackgroundUrl = backgroundUrl !== undefined
+    ? (isValidR2Url(backgroundUrl) ? backgroundUrl : user.background_url)
+    : user.background_url;
 
-  db.prepare("UPDATE users SET display_name = ?, bio = ? WHERE id = ?").run(nextDisplayName, nextBio, req.params.id);
-  const updated = db.prepare("SELECT id, username, display_name, avatar_url, bio FROM users WHERE id = ?").get(req.params.id);
-  res.json(updated);
+  db.prepare("UPDATE users SET display_name = ?, bio = ?, avatar_url = ?, background_url = ? WHERE id = ?")
+    .run(nextDisplayName, nextBio, nextAvatarUrl, nextBackgroundUrl, req.params.id);
+  const updated = db.prepare("SELECT id, username, display_name, avatar_url, background_url, bio FROM users WHERE id = ?").get(req.params.id);
+  res.json(publicUserView(updated));
+});
+
+// 头像 / 个人资料背景图上传:和视频上传复用同一套"预签名直传 R2"模式,
+// 只是换了存储路径前缀(avatars/ 或 backgrounds/)和校验(必须是 image/*)。
+app.post("/api/users/me/image-upload-url", requireAuth, uploadLimiter, async (req, res) => {
+  const { kind, filename, contentType } = req.body;
+  if (!["avatar", "background"].includes(kind)) return res.status(400).json({ error: "kind 必须是 avatar 或 background" });
+  if (!filename || !contentType) return res.status(400).json({ error: "filename 和 contentType 必填" });
+  if (!String(contentType).startsWith("image/")) return res.status(400).json({ error: "只能上传图片文件" });
+  if (!process.env.R2_BUCKET_NAME || !process.env.R2_ACCOUNT_ID) {
+    return res.status(500).json({ error: "服务端未配置 R2 存储,无法生成上传地址,请检查 .env" });
+  }
+
+  const prefix = kind === "avatar" ? "avatars" : "backgrounds";
+  const objectKey = `${prefix}/${req.userId}-${Date.now()}-${String(filename).replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+
+  try {
+    const command = new PutObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: objectKey, ContentType: contentType });
+    const uploadUrl = await getSignedUrl(r2, command, { expiresIn: 600 });
+    const publicUrl = `${process.env.R2_PUBLIC_URL}/${objectKey}`;
+    res.json({ uploadUrl, publicUrl });
+  } catch (err) {
+    console.error("[R2] 生成头像/背景图预签名上传地址失败:", err);
+    res.status(500).json({ error: "生成上传地址失败" });
+  }
 });
 
 /* =========================================================================
