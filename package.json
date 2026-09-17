@@ -1,8 +1,12 @@
 {
-  "name": "ownlo-backend",
-  "version": "0.1.0",
-  "description": "Ownlo 私信/群聊后端服务(MVP阶段)",
+  "name": "loopa-backend",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Ownlo 私信/群聊/支付/身份认证后端服务",
   "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
@@ -13,7 +17,10 @@
     "better-sqlite3": "^11.3.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
+    "ethers": "^6.13.4",
     "express": "^4.19.2",
+    "express-rate-limit": "^7.4.1",
+    "google-auth-library": "^9.14.1",
     "socket.io": "^4.7.5",
     "uuid": "^9.0.1"
   }
