@@ -2120,12 +2120,29 @@ app.post("/api/livestreams/:id/gifts", requireAuth, paymentLimiter, (req, res) =
 
 // 背景音乐曲库:公开可查,url 是相对路径(比如 /music/xxx.mp3),由上面的
 // express.static 中间件直接提供文件,前端自己拼上 backendUrl() 前缀播放。
+// is_builtin ASC 排在前面:你自己放进 public/music/ 目录、被自动扫描登记的曲目
+// (is_builtin=0)会排在那 8 首内置合成曲(is_builtin=1)前面——内置的那几首
+// 本来就只是占位示范用,你自己的真实曲库理应优先展示。
 app.get("/api/music/tracks", optionalAuth, (req, res) => {
   const tracks = db.prepare(`
     SELECT id, title, artist, url, duration_seconds AS durationSeconds
-    FROM music_tracks WHERE is_active = 1 ORDER BY sort_order ASC
+    FROM music_tracks WHERE is_active = 1 ORDER BY is_builtin ASC, sort_order ASC
   `).all();
   res.json({ tracks });
+});
+
+// 本轮新增:手动触发重新扫描 public/music/ 目录的曲库同步——正常情况下服务
+// 每次启动都会自动扫描一遍(见 db.js 的 syncMusicLibraryFromDisk),但如果你在
+// 服务不重启的情况下往 public/music/ 目录里新增/删除了文件(比如用 BT 面板
+// 文件管理器直接上传),调用这个接口就能立刻生效,不用专门重启一次 Node 服务。
+app.post("/api/music/rescan", requireAuth, (req, res) => {
+  try {
+    const result = db.syncMusicLibraryFromDisk();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[POST /api/music/rescan] 出错:", err);
+    res.status(500).json({ error: "重新扫描曲库失败,请查看服务端日志" });
+  }
 });
 
 /* =========================================================================

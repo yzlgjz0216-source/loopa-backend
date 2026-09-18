@@ -441,8 +441,11 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_gift_sends_livestream ON gift_sends(livestream_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_gift_sends_receiver ON gift_sends(receiver_id, created_at);
 
-  -- 背景音乐曲库表:本轮随包附带的都是纯合成、自建的原创免版权音乐(见部署说明),
-  -- url 是相对路径,由后端 /music 静态目录直接提供,不依赖对象存储配置也能用。
+  -- 背景音乐曲库表:随包附带的 8 首(is_builtin=1)是纯合成、自建的原创免版权音乐
+  -- (见部署说明);is_builtin=0 的是你自己放进 public/music/ 目录、由下面
+  -- syncMusicLibraryFromDisk() 自动扫描登记的曲目——这张表本身就是"共享曲库"的
+  -- 唯一数据来源,以后直播背景音乐、发布视频配乐等任何功能都读同一张表,不用
+  -- 各自维护一份。url 是相对路径,由后端 /music 静态目录直接提供,不依赖对象存储配置也能用。
   CREATE TABLE IF NOT EXISTS music_tracks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -450,7 +453,8 @@ db.exec(`
     url TEXT NOT NULL,
     duration_seconds INTEGER,
     sort_order INTEGER NOT NULL DEFAULT 0,
-    is_active INTEGER NOT NULL DEFAULT 1
+    is_active INTEGER NOT NULL DEFAULT 1,
+    is_builtin INTEGER NOT NULL DEFAULT 0
   );
 `);
 
@@ -567,6 +571,15 @@ try {
   }
 }
 
+// music_tracks 表的 is_builtin 字段同理做兼容迁移(老数据库可能是本轮之前创建的,没有这一列)
+try {
+  db.exec(`ALTER TABLE music_tracks ADD COLUMN is_builtin INTEGER NOT NULL DEFAULT 0`);
+} catch (e) {
+  if (!/duplicate column name/i.test(e.message)) {
+    console.error(`[db migration] music_tracks 表添加 is_builtin 失败:`, e.message);
+  }
+}
+
 // 本轮新增:礼物目录种子数据——只在表是空的时候插入一次,不会每次启动重复插入
 // 或者覆盖掉你以后在后台手工调整过的价格/上下架状态。价格设计参考了抖音直播间
 // "礼物墙"常见的价格分布(小礼物几金币到几十金币、大礼物几百到上千金币),
@@ -619,7 +632,7 @@ try {
   const musicCount = db.prepare(`SELECT COUNT(*) AS c FROM music_tracks`).get().c;
   if (musicCount === 0) {
     const insertTrack = db.prepare(
-      `INSERT INTO music_tracks (id, title, artist, url, duration_seconds, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)`
+      `INSERT INTO music_tracks (id, title, artist, url, duration_seconds, sort_order, is_active, is_builtin) VALUES (?, ?, ?, ?, ?, ?, 1, 1)`
     );
     const insertMany = db.transaction((rows) => {
       for (const m of rows) insertTrack.run(m.id, m.title, m.artist, `/music/${m.file}`, m.duration, m.sort);
@@ -631,4 +644,96 @@ try {
   console.error("[db seed] 写入背景音乐种子数据失败:", e.message);
 }
 
+/* ---------------------------------------------------------------------------
+   本轮新增:背景音乐"共享曲库"自动扫描登记 —— 对应你提的"以后加音乐只要
+   复制文件进去就行"这个诉求。设计上没有做成一个独立的仓库/服务,而是继续放在
+   这一个后端项目里的 public/music/ 目录下,原因很简单:额外拆一个仓库对"直播
+   背景音乐"和"以后发布视频配乐"这两个用同一批文件、同一张数据库表的功能来说,
+   只会多一层部署/同步的麻烦(还要单独 clone、单独更新),没有实际好处。
+   "共享"体现在数据层:music_tracks 这一张表 + public/music/ 这一个目录,就是
+   唯一的曲库来源,不管以后哪个功能要放背景音乐,都读写这一份,不需要各自复制。
+
+   工作方式:每次服务启动时,扫描 public/music/ 目录下所有音频文件,把还没在
+   数据库里登记过的文件自动插入一行(标题从文件名解析,支持"歌手 - 歌名.mp3"
+   这种最常见的下载命名习惯,没有这个格式就直接用文件名当标题);同时反过来,
+   如果数据库里登记过的某个"用户自己放的"文件已经从磁盘上被删掉了,就把它标成
+   下架(is_active=0),避免播放器还想播一个已经不存在的文件。
+   ⚠️ 没有引入任何第三方"读取MP3标签"的库(比如 music-metadata)——不是做不到,
+   而是不想为了一个"标题好看一点"的锦上添花功能,再给你增加一次"装新依赖包
+   踩坑"的风险(上次 livekit-server-sdk 装包踩过 npm 镜像同步延迟的坑,教训还在)。
+   文件名解析已经能覆盖绝大多数你从各处下载下来的音乐文件的命名习惯了。
+   --------------------------------------------------------------------------- */
+const fs = require("fs");
+const crypto = require("crypto");
+const MUSIC_DIR = path.join(__dirname, "public", "music");
+const SUPPORTED_MUSIC_EXT = [".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac"];
+
+function parseTitleArtistFromFilename(filename) {
+  const base = filename.replace(/\.[^.]+$/, ""); // 去掉扩展名
+  // "歌手 - 歌名" / "歌手-歌名" 是下载音乐最常见的命名习惯,尽量识别出来拆成两段;
+  // 识别不出这个格式就整个文件名当标题、歌手留空(后台以后也可以手工改)。
+  const m = base.match(/^\s*(.+?)\s*[-–—]\s*(.+?)\s*$/);
+  if (m && m[1] && m[2]) return { title: m[2], artist: m[1] };
+  return { title: base, artist: null };
+}
+
+function syncMusicLibraryFromDisk() {
+  let files;
+  try {
+    if (!fs.existsSync(MUSIC_DIR)) fs.mkdirSync(MUSIC_DIR, { recursive: true });
+    files = fs.readdirSync(MUSIC_DIR).filter((f) => SUPPORTED_MUSIC_EXT.includes(path.extname(f).toLowerCase()));
+  } catch (e) {
+    console.error("[db] 扫描 public/music/ 目录失败:", e.message);
+    return { added: 0, deactivated: 0 };
+  }
+
+  const existingByUrl = new Map(
+    db.prepare(`SELECT id, url, is_builtin FROM music_tracks`).all().map((r) => [r.url, r])
+  );
+
+  let added = 0;
+  const insertTrack = db.prepare(
+    `INSERT INTO music_tracks (id, title, artist, url, duration_seconds, sort_order, is_active, is_builtin) VALUES (?, ?, ?, ?, NULL, ?, 1, 0)`
+  );
+  const seenUrls = new Set();
+  files.forEach((filename, idx) => {
+    const url = `/music/${encodeURIComponent(filename)}`;
+    seenUrls.add(url);
+    if (existingByUrl.has(url)) return; // 已经登记过,跳过——不覆盖你可能在数据库里手工改过的标题
+    const { title, artist } = parseTitleArtistFromFilename(filename);
+    const id = "music_user_" + crypto.createHash("sha1").update(filename).digest("hex").slice(0, 16);
+    try {
+      // sort_order 给一个很小的负数,配合下面 server.js 查询里的
+      // "ORDER BY is_builtin ASC, sort_order ASC",让你自己放的曲目默认排在
+      // 那 8 首内置合成曲前面(毕竟内置的那几首本来就只是占位示范用)。
+      insertTrack.run(id, title, artist, url, idx - files.length);
+      added++;
+    } catch (e) {
+      console.error(`[db] 登记曲库文件 "${filename}" 失败:`, e.message);
+    }
+  });
+
+  // 反向检查:数据库里"非内置"的曲目,如果对应文件已经不在磁盘上了,标记下架
+  let deactivated = 0;
+  const deactivateStmt = db.prepare(`UPDATE music_tracks SET is_active = 0 WHERE id = ?`);
+  for (const [url, row] of existingByUrl) {
+    if (!row.is_builtin && !seenUrls.has(url)) {
+      deactivateStmt.run(row.id);
+      deactivated++;
+    }
+  }
+
+  if (added || deactivated) {
+    console.log(`[db] 背景音乐曲库自动扫描:新增 ${added} 首,下架 ${deactivated} 首(文件已不存在)`);
+  }
+  return { added, deactivated };
+}
+
+try {
+  syncMusicLibraryFromDisk();
+} catch (e) {
+  console.error("[db] 启动时自动扫描背景音乐曲库失败:", e.message);
+}
+
 module.exports = db;
+module.exports.syncMusicLibraryFromDisk = syncMusicLibraryFromDisk;
