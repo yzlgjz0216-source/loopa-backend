@@ -368,6 +368,90 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_livestreams_status ON livestreams(status, started_at);
   CREATE INDEX IF NOT EXISTS idx_livestreams_host ON livestreams(host_id, started_at);
+
+  /* =======================================================================
+     以下为本轮(礼物/金币钱包/背景音乐)新增的表。
+     架构(已和你确认过):用户先用真实 Pi 买"平台金币"(1 Pi = 10 金币,
+     走和 tips 表一样的 Pi 支付 approve/complete 两段式流程),送礼物时
+     直接从金币余额里瞬间扣除(不再单独发起一笔链上交易),主播收到礼物后
+     累积到自己的"钻石余额"(diamond_balance)——钻石提现成 Pi 这件事本轮
+     明确不做,先留着字段,后面再做提现功能。
+     ======================================================================= */
+
+  -- 钱包表:每个用户一行,一边是"花钱用的"金币余额,一边是"赚钱用的"钻石余额。
+  -- 这两个余额完全独立、不能互相换算——金币只能花(买礼物),钻石只能攒(等未来提现)。
+  CREATE TABLE IF NOT EXISTS wallets (
+    user_id TEXT PRIMARY KEY,
+    coin_balance INTEGER NOT NULL DEFAULT 0,
+    diamond_balance INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  -- 金币购买流水表:结构完全照抄 tips 表的"两段式"记账模式(approved → completed),
+  -- payment_id 唯一约束防止 Pi SDK 重试导致重复入账,道理和 tips 表注释里写的一样。
+  -- coin_amount 是这笔订单最终要入账到 wallets.coin_balance 的金币数量
+  -- (按下单那一刻的汇率算好,汇率以后即使调整也不影响历史订单的金币数)。
+  CREATE TABLE IF NOT EXISTS coin_purchases (
+    id TEXT PRIMARY KEY,
+    payment_id TEXT UNIQUE NOT NULL,
+    tx_id TEXT,
+    buyer_user_id TEXT NOT NULL,
+    pi_amount REAL NOT NULL,
+    pi_amount_units INTEGER,
+    coin_amount INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'approved' CHECK(status IN ('approved', 'completed', 'failed')),
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    FOREIGN KEY (buyer_user_id) REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_coin_purchases_buyer ON coin_purchases(buyer_user_id, status);
+
+  -- 礼物目录表:平台预设的礼物款式,coin_price 是这个礼物要花多少金币,
+  -- tier 只是用来在前端分组展示(小礼物/中礼物/大礼物),不影响实际扣费逻辑。
+  -- icon 存 emoji 字符串——遵循项目一贯的"视觉素材保持原创"原则,不使用
+  -- 任何第三方图标/图片资源。
+  CREATE TABLE IF NOT EXISTS gift_catalog (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    icon TEXT NOT NULL,
+    coin_price INTEGER NOT NULL,
+    tier TEXT NOT NULL DEFAULT 'small' CHECK(tier IN ('small', 'medium', 'large')),
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
+  );
+
+  -- 送礼记录表:一次送礼(可以一次送多个,quantity)是一行。coin_cost 是这一行
+  -- 实际扣掉的金币总数(= 送礼那一刻的单价 × quantity,即使目录后续改价也不影响历史记录)。
+  -- livestream_id 允许为空,是为了以后如果要支持"给主播个人主页送礼"(不在直播间里)留出空间。
+  CREATE TABLE IF NOT EXISTS gift_sends (
+    id TEXT PRIMARY KEY,
+    livestream_id TEXT,
+    gift_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    receiver_id TEXT NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    coin_cost INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (livestream_id) REFERENCES livestreams(id),
+    FOREIGN KEY (gift_id) REFERENCES gift_catalog(id),
+    FOREIGN KEY (sender_id) REFERENCES users(id),
+    FOREIGN KEY (receiver_id) REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_gift_sends_livestream ON gift_sends(livestream_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_gift_sends_receiver ON gift_sends(receiver_id, created_at);
+
+  -- 背景音乐曲库表:本轮随包附带的都是纯合成、自建的原创免版权音乐(见部署说明),
+  -- url 是相对路径,由后端 /music 静态目录直接提供,不依赖对象存储配置也能用。
+  CREATE TABLE IF NOT EXISTS music_tracks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    artist TEXT,
+    url TEXT NOT NULL,
+    duration_seconds INTEGER,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
+  );
 `);
 
 // 兼容性迁移:如果是从旧版本升级上来的数据库,users表可能缺少这些新增字段,
@@ -481,6 +565,70 @@ try {
   if (!/duplicate column name/i.test(e.message)) {
     console.error(`[db migration] conversation_members 表添加 cleared_before 失败:`, e.message);
   }
+}
+
+// 本轮新增:礼物目录种子数据——只在表是空的时候插入一次,不会每次启动重复插入
+// 或者覆盖掉你以后在后台手工调整过的价格/上下架状态。价格设计参考了抖音直播间
+// "礼物墙"常见的价格分布(小礼物几金币到几十金币、大礼物几百到上千金币),
+// 图标全部用 emoji,不使用任何第三方美术资源。
+const giftCatalogSeed = [
+  { id: "gift_rose", name: "玫瑰", icon: "🌹", price: 1, tier: "small", sort: 1 },
+  { id: "gift_lollipop", name: "棒棒糖", icon: "🍭", price: 5, tier: "small", sort: 2 },
+  { id: "gift_heart", name: "爱心", icon: "💗", price: 10, tier: "small", sort: 3 },
+  { id: "gift_icecream", name: "冰淇淋", icon: "🍦", price: 20, tier: "small", sort: 4 },
+  { id: "gift_beer", name: "干杯", icon: "🍻", price: 30, tier: "small", sort: 5 },
+  { id: "gift_bell", name: "铃铛", icon: "🔔", price: 50, tier: "medium", sort: 6 },
+  { id: "gift_gift", name: "礼物盒", icon: "🎁", price: 88, tier: "medium", sort: 7 },
+  { id: "gift_ring", name: "戒指", icon: "💍", price: 199, tier: "medium", sort: 8 },
+  { id: "gift_rocket", name: "火箭", icon: "🚀", price: 520, tier: "large", sort: 9 },
+  { id: "gift_crown", name: "皇冠", icon: "👑", price: 1000, tier: "large", sort: 10 },
+  { id: "gift_castle", name: "城堡", icon: "🏰", price: 1999, tier: "large", sort: 11 },
+  { id: "gift_galaxy", name: "宇宙", icon: "🌌", price: 5200, tier: "large", sort: 12 },
+];
+try {
+  const giftCount = db.prepare(`SELECT COUNT(*) AS c FROM gift_catalog`).get().c;
+  if (giftCount === 0) {
+    const insertGift = db.prepare(
+      `INSERT INTO gift_catalog (id, name, icon, coin_price, tier, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)`
+    );
+    const insertMany = db.transaction((rows) => {
+      for (const g of rows) insertGift.run(g.id, g.name, g.icon, g.price, g.tier, g.sort);
+    });
+    insertMany(giftCatalogSeed);
+    console.log(`[db seed] 已写入 ${giftCatalogSeed.length} 条礼物目录种子数据`);
+  }
+} catch (e) {
+  console.error("[db seed] 写入礼物目录种子数据失败:", e.message);
+}
+
+// 本轮新增:背景音乐曲库种子数据——同样只在表为空时插入一次。这几首都是
+// 本轮用代码纯合成生成的原创循环音乐(正弦/三角波振荡器 + 简单鼓点包络,
+// 没有采样任何现成录音或已有作品),文件随后端一起部署在 public/music/ 目录下,
+// 由 server.js 里的 /music 静态路由直接提供访问,不依赖 R2/对象存储配置。
+const musicTracksSeed = [
+  { id: "music_chillwave", title: "City Chillwave", artist: "Ownlo Originals", file: "music_chillwave.mp3", duration: 22, sort: 1 },
+  { id: "music_dreamypad", title: "Dreamy Skyline", artist: "Ownlo Originals", file: "music_dreamypad.mp3", duration: 27, sort: 2 },
+  { id: "music_upbeatpop", title: "Sunny Pop Loop", artist: "Ownlo Originals", file: "music_upbeatpop.mp3", duration: 16, sort: 3 },
+  { id: "music_warmacoustic", title: "Warm Afternoon", artist: "Ownlo Originals", file: "music_warmacoustic.mp3", duration: 21, sort: 4 },
+  { id: "music_midnightlo", title: "Midnight Lo-fi", artist: "Ownlo Originals", file: "music_midnightlo.mp3", duration: 25, sort: 5 },
+  { id: "music_sparklebeat", title: "Sparkle Beat", artist: "Ownlo Originals", file: "music_sparklebeat.mp3", duration: 15, sort: 6 },
+  { id: "music_softpiano", title: "Soft Piano Drift", artist: "Ownlo Originals", file: "music_softpiano.mp3", duration: 28, sort: 7 },
+  { id: "music_partyenergy", title: "Party Energy", artist: "Ownlo Originals", file: "music_partyenergy.mp3", duration: 16, sort: 8 },
+];
+try {
+  const musicCount = db.prepare(`SELECT COUNT(*) AS c FROM music_tracks`).get().c;
+  if (musicCount === 0) {
+    const insertTrack = db.prepare(
+      `INSERT INTO music_tracks (id, title, artist, url, duration_seconds, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)`
+    );
+    const insertMany = db.transaction((rows) => {
+      for (const m of rows) insertTrack.run(m.id, m.title, m.artist, `/music/${m.file}`, m.duration, m.sort);
+    });
+    insertMany(musicTracksSeed);
+    console.log(`[db seed] 已写入 ${musicTracksSeed.length} 条背景音乐种子数据`);
+  }
+} catch (e) {
+  console.error("[db seed] 写入背景音乐种子数据失败:", e.message);
 }
 
 module.exports = db;

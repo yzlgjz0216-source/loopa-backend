@@ -72,6 +72,7 @@ require("dotenv").config();
 const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
+const path = require("path");
 const http = require("http");
 const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
@@ -318,6 +319,11 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json());
+
+// 本轮新增:背景音乐曲库静态目录——这几首都是随代码一起打包的、纯合成生成的
+// 原创免版权音乐(见 db.js 里 music_tracks 种子数据的注释),文件不大,直接从
+// 后端本地磁盘提供即可,不需要额外配置 R2/对象存储就能用。
+app.use("/music", express.static(path.join(__dirname, "public", "music")));
 
 // 调试用的全量请求日志,默认关闭(避免生产环境日志里堆满噪音,也避免
 // 意外把带敏感信息的请求路径打进日志),需要时在 .env 设置 DEBUG_REQUEST_LOG=true
@@ -1027,6 +1033,13 @@ app.post("/api/videos", requireAuth, uploadLimiter, (req, res) => {
 app.get("/api/videos/feed", optionalAuth, (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 50);
   const before = Number(req.query.before) || Date.now();
+  // 本轮新增:?following=1 时只返回"我关注的人"发布的视频,对应首页新增的
+  // 左右滑动"关注/推荐"标签页(做法A)。必须登录才有意义,未登录访问直接报错,
+  // 前端在没有登录态时会提示登录而不是发这个请求。
+  const followingOnly = req.query.following === "1";
+  if (followingOnly && !req.userId) {
+    return res.status(401).json({ error: "请先登录后查看关注的人发布的视频" });
+  }
 
   // 本轮修复:v.creator_name 只是发布视频那一刻的用户名快照,改资料(改昵称/传头像)
   // 之后永远不会再更新,Feed 卡片一直显示的是最初注册时的旧名字,而且原来这里压根
@@ -1034,27 +1047,43 @@ app.get("/api/videos/feed", optionalAuth, (req, res) => {
   // "此刻"真实的昵称和头像(LEFT JOIN 是为了防止创作者账号被删掉后这条视频从 Feed 里
   // 整个消失,这种情况下 creator_display_name/creator_avatar_url 就是 null,前端会自动
   // 回退到旧的 creator_name)。
-  const videos = req.userId
-    ? db.prepare(`
-        SELECT v.id, v.creator_id, v.creator_name, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
-               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
-               (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
-        FROM videos v
-        LEFT JOIN users u ON u.id = v.creator_id
-        WHERE v.status = 'published' AND v.created_at < ?
-          AND v.creator_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
-          AND v.creator_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
-        ORDER BY v.created_at DESC LIMIT ?
-      `).all(before, req.userId, req.userId, limit)
-    : db.prepare(`
-        SELECT v.id, v.creator_id, v.creator_name, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
-               u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
-               (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
-        FROM videos v
-        LEFT JOIN users u ON u.id = v.creator_id
-        WHERE v.status = 'published' AND v.created_at < ?
-        ORDER BY v.created_at DESC LIMIT ?
-      `).all(before, limit);
+  let videos;
+  if (req.userId && followingOnly) {
+    videos = db.prepare(`
+      SELECT v.id, v.creator_id, v.creator_name, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
+             u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+             (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
+      FROM videos v
+      LEFT JOIN users u ON u.id = v.creator_id
+      WHERE v.status = 'published' AND v.created_at < ?
+        AND v.creator_id IN (SELECT creator_id FROM follows WHERE follower_id = ?)
+        AND v.creator_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+        AND v.creator_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
+      ORDER BY v.created_at DESC LIMIT ?
+    `).all(before, req.userId, req.userId, req.userId, limit);
+  } else if (req.userId) {
+    videos = db.prepare(`
+      SELECT v.id, v.creator_id, v.creator_name, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
+             u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+             (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
+      FROM videos v
+      LEFT JOIN users u ON u.id = v.creator_id
+      WHERE v.status = 'published' AND v.created_at < ?
+        AND v.creator_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+        AND v.creator_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
+      ORDER BY v.created_at DESC LIMIT ?
+    `).all(before, req.userId, req.userId, limit);
+  } else {
+    videos = db.prepare(`
+      SELECT v.id, v.creator_id, v.creator_name, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
+             u.display_name AS creator_display_name, u.avatar_url AS creator_avatar_url,
+             (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
+      FROM videos v
+      LEFT JOIN users u ON u.id = v.creator_id
+      WHERE v.status = 'published' AND v.created_at < ?
+      ORDER BY v.created_at DESC LIMIT ?
+    `).all(before, limit);
+  }
 
   res.json(videos);
 });
@@ -1870,6 +1899,233 @@ app.post("/api/livestreams/:id/join", requireAuth, requireLiveKitConfigured, asy
     console.error("[POST /api/livestreams/:id/join] 出错:", err);
     res.status(500).json({ error: "加入直播间失败,请稍后重试" });
   }
+});
+
+/* =========================================================================
+   金币钱包 + 礼物系统(本轮新增,对应你确认的"方案甲":用户先用真实 Pi
+   买平台金币——固定汇率 1 Pi = 10 金币,走的是和上面 /api/payments/approve、
+   /api/payments/complete 完全一样的两段式 Pi 支付流程,只是最后落账的地方
+   从 tips 表换成 wallets.coin_balance——送礼物时直接从金币余额里瞬间扣除,
+   不再单独发起一笔链上交易。主播收到礼物,累积到自己的"钻石余额"
+   (diamond_balance),钻石提现成 Pi 这件事本轮明确不做,只留字段占位。
+   ========================================================================= */
+const COIN_PER_PI = 10; // 固定汇率:1 Pi = 10 平台金币
+
+// 取(或懒创建)一个账号的钱包行。绝大多数账号在注册时不会立刻有钱包记录,
+// 第一次查询/消费/充值时才需要它存在,所以用 INSERT OR IGNORE 保证幂等。
+function getOrCreateWallet(userId) {
+  db.prepare(`INSERT OR IGNORE INTO wallets (user_id, coin_balance, diamond_balance, updated_at) VALUES (?, 0, 0, ?)`)
+    .run(userId, Date.now());
+  return db.prepare("SELECT user_id, coin_balance, diamond_balance FROM wallets WHERE user_id = ?").get(userId);
+}
+
+// 查询我自己的钱包余额
+app.get("/api/wallet/me", requireAuth, (req, res) => {
+  const wallet = getOrCreateWallet(req.userId);
+  res.json({ coinBalance: wallet.coin_balance, diamondBalance: wallet.diamond_balance });
+});
+
+// 充值第一步:批准 Pi 支付(结构照抄 /api/payments/approve,只是落账目标表换成
+// coin_purchases 而不是 tips)。coin_amount 按下单那一刻的固定汇率算好存起来,
+// 即使汇率以后调整也不影响这笔已经发起的订单。
+app.post("/api/wallet/purchase/approve", requireAuth, paymentLimiter, async (req, res) => {
+  const { paymentId } = req.body;
+  if (!paymentId) return res.status(400).json({ error: "paymentId 必填" });
+  if (!process.env.PI_API_KEY) {
+    console.error("[Wallet] ⚠️ PI_API_KEY 未配置,无法调用 Pi 官方 API,批准请求已中止");
+    return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
+  }
+
+  try {
+    const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/approve`, {
+      method: "POST",
+      headers: { Authorization: `Key ${process.env.PI_API_KEY}` },
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("[Pi API] 批准金币充值支付失败:", response.status, errText);
+      return res.status(502).json({ ok: false, error: "Pi 官方 API 批准失败", detail: errText });
+    }
+    const payment = await response.json();
+
+    try {
+      const piAmountUnits = Math.round(Number(payment.amount) * 10000000);
+      const coinAmount = Math.round(Number(payment.amount) * COIN_PER_PI);
+      db.prepare(`
+        INSERT OR IGNORE INTO coin_purchases
+          (id, payment_id, buyer_user_id, pi_amount, pi_amount_units, coin_amount, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'approved', ?)
+      `).run(uuidv4(), paymentId, req.userId, payment.amount, piAmountUnits, coinAmount, Date.now());
+    } catch (dbErr) {
+      console.error("[Wallet] ⚠️ 写入金币充值流水表失败(不影响本次支付批准结果):", dbErr);
+    }
+
+    res.json({ ok: true, payment });
+  } catch (err) {
+    console.error("[Pi API] 批准金币充值支付出错:", err);
+    res.status(500).json({ ok: false, error: "服务端调用 Pi API 出错" });
+  }
+});
+
+// 充值第二步:确认支付完成、真正把金币加到钱包里(结构照抄 /api/payments/complete
+// 的幂等写法:原子的 "UPDATE ... WHERE status='approved'" + .changes 判断,
+// Pi SDK 自动重试或用户手动重复点击都不会导致同一笔充值被重复加两次金币)。
+app.post("/api/wallet/purchase/complete", requireAuth, paymentLimiter, async (req, res) => {
+  const { paymentId, txid } = req.body;
+  if (!paymentId || !txid) return res.status(400).json({ error: "paymentId 和 txid 必填" });
+  if (!process.env.PI_API_KEY) {
+    console.error("[Wallet] ⚠️ PI_API_KEY 未配置,无法调用 Pi 官方 API,完成请求已中止");
+    return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
+  }
+
+  try {
+    const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/complete`, {
+      method: "POST",
+      headers: { Authorization: `Key ${process.env.PI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ txid }),
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("[Pi API] 完成金币充值确认失败:", response.status, errText);
+      return res.status(502).json({ ok: false, error: "Pi 官方 API 完成确认失败", detail: errText });
+    }
+    const payment = await response.json();
+
+    let newCoinBalance = null;
+    try {
+      const tx = db.transaction(() => {
+        const updateResult = db.prepare(
+          "UPDATE coin_purchases SET status = 'completed', tx_id = ?, completed_at = ? WHERE payment_id = ? AND status = 'approved'"
+        ).run(txid, Date.now(), paymentId);
+
+        if (updateResult.changes !== 1) {
+          console.warn(`[Wallet] paymentId=${paymentId} 不是首次 complete(可能是重试),跳过金币入账,这是预期行为`);
+          return;
+        }
+
+        const purchase = db.prepare("SELECT coin_amount, buyer_user_id FROM coin_purchases WHERE payment_id = ?").get(paymentId);
+        if (!purchase) return;
+
+        getOrCreateWallet(purchase.buyer_user_id); // 确保钱包行已存在
+        db.prepare(`UPDATE wallets SET coin_balance = coin_balance + ?, updated_at = ? WHERE user_id = ?`)
+          .run(purchase.coin_amount, Date.now(), purchase.buyer_user_id);
+
+        newCoinBalance = db.prepare("SELECT coin_balance FROM wallets WHERE user_id = ?").get(purchase.buyer_user_id)?.coin_balance;
+      });
+      tx();
+    } catch (dbErr) {
+      console.error("[Wallet] ⚠️ 更新金币充值流水/钱包余额失败(不影响本次支付完成结果):", dbErr);
+    }
+
+    res.json({ ok: true, payment, coinBalance: newCoinBalance });
+  } catch (err) {
+    console.error("[Pi API] 完成金币充值确认出错:", err);
+    res.status(500).json({ ok: false, error: "服务端调用 Pi API 出错" });
+  }
+});
+
+// 礼物目录:公开可查(不需要登录也能看直播间礼物墙长什么样)
+app.get("/api/gifts/catalog", optionalAuth, (req, res) => {
+  const gifts = db.prepare(`
+    SELECT id, name, icon, coin_price AS coinPrice, tier, sort_order AS sortOrder
+    FROM gift_catalog WHERE is_active = 1 ORDER BY sort_order ASC
+  `).all();
+  res.json({ gifts });
+});
+
+// 送礼物:直播间里送给主播。原子扣减发送者金币余额 + 累加主播钻石余额,
+// 余额不够直接拒绝(不允许透支),成功后广播 live_gift 事件驱动前端动效
+// 和聊天区横幅,并给主播发一条通知(复用 notifications.type='tip',因为
+// notifications 表的 CHECK 约束目前只允许 like/comment/follow/tip/system 这几种,
+// 给已经在生产环境跑着的旧数据库加新枚举值需要重建整张表、风险较高,这里选择
+// 用 content 文案区分"这是一条礼物通知"而不是改表结构)。
+app.post("/api/livestreams/:id/gifts", requireAuth, paymentLimiter, (req, res) => {
+  const livestreamId = req.params.id;
+  const giftId = String(req.body?.giftId || "");
+  const quantity = Math.max(1, Math.min(99, parseInt(req.body?.quantity, 10) || 1));
+  if (!giftId) return res.status(400).json({ error: "giftId 必填" });
+
+  const live = db.prepare("SELECT id, host_id, status FROM livestreams WHERE id = ?").get(livestreamId);
+  if (!live) return res.status(404).json({ error: "直播不存在" });
+  if (live.status !== "live") return res.status(410).json({ error: "这场直播已经结束了" });
+  if (live.host_id === req.userId) return res.status(400).json({ error: "不能给自己送礼物" });
+
+  const gift = db.prepare("SELECT id, name, icon, coin_price FROM gift_catalog WHERE id = ? AND is_active = 1").get(giftId);
+  if (!gift) return res.status(404).json({ error: "礼物不存在或已下架" });
+
+  const senderTierRow = db.prepare("SELECT age_tier FROM users WHERE id = ?").get(req.userId);
+  if (senderTierRow && !canTip(senderTierRow.age_tier)) return res.status(403).json({ error: "当前账号年龄分级不允许送礼物" });
+  const host = db.prepare("SELECT age_tier, username, display_name FROM users WHERE id = ?").get(live.host_id);
+  if (host && !canReceiveTip(host.age_tier)) return res.status(403).json({ error: "对方账号年龄分级不允许接收礼物" });
+
+  const coinCost = gift.coin_price * quantity;
+  let result;
+  try {
+    const tx = db.transaction(() => {
+      getOrCreateWallet(req.userId);
+      getOrCreateWallet(live.host_id);
+
+      // 原子扣费:UPDATE ... WHERE coin_balance >= ? ,一步到位判断余额是否够、
+      // 不够就不会真的扣掉——避免"先查余额、再扣款"两步之间的并发竞态窗口。
+      const deduct = db.prepare(
+        "UPDATE wallets SET coin_balance = coin_balance - ?, updated_at = ? WHERE user_id = ? AND coin_balance >= ?"
+      ).run(coinCost, Date.now(), req.userId, coinCost);
+      if (deduct.changes !== 1) {
+        result = { insufficient: true };
+        return;
+      }
+
+      db.prepare("UPDATE wallets SET diamond_balance = diamond_balance + ?, updated_at = ? WHERE user_id = ?")
+        .run(coinCost, Date.now(), live.host_id);
+
+      const sendId = uuidv4();
+      const now = Date.now();
+      db.prepare(`
+        INSERT INTO gift_sends (id, livestream_id, gift_id, sender_id, receiver_id, quantity, coin_cost, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(sendId, livestreamId, gift.id, req.userId, live.host_id, quantity, coinCost, now);
+
+      const senderCoinBalance = db.prepare("SELECT coin_balance FROM wallets WHERE user_id = ?").get(req.userId).coin_balance;
+      result = { insufficient: false, sendId, createdAt: now, senderCoinBalance };
+    });
+    tx();
+  } catch (dbErr) {
+    console.error("[POST /api/livestreams/:id/gifts] 出错:", dbErr);
+    return res.status(500).json({ error: "送礼物失败,请稍后重试" });
+  }
+
+  if (result.insufficient) {
+    return res.status(402).json({ error: "金币余额不足,请先充值", code: "INSUFFICIENT_COINS" });
+  }
+
+  const sender = db.prepare("SELECT id, username, display_name, avatar_url FROM users WHERE id = ?").get(req.userId);
+  const payload = {
+    livestreamId,
+    sendId: result.sendId,
+    gift: { id: gift.id, name: gift.name, icon: gift.icon, coinPrice: gift.coin_price },
+    quantity,
+    coinCost,
+    sender: sender ? { id: sender.id, username: sender.username, displayName: sender.display_name, avatarUrl: sender.avatar_url } : null,
+    createdAt: result.createdAt,
+  };
+  io.to(`live:${livestreamId}`).emit("live_gift", payload);
+
+  createNotification({
+    userId: live.host_id, type: "tip", actorId: req.userId,
+    content: `${sender?.display_name || sender?.username || "有人"} 送出了 ${gift.icon}${gift.name} x${quantity}`,
+  });
+
+  res.json({ ok: true, senderCoinBalance: result.senderCoinBalance });
+});
+
+// 背景音乐曲库:公开可查,url 是相对路径(比如 /music/xxx.mp3),由上面的
+// express.static 中间件直接提供文件,前端自己拼上 backendUrl() 前缀播放。
+app.get("/api/music/tracks", optionalAuth, (req, res) => {
+  const tracks = db.prepare(`
+    SELECT id, title, artist, url, duration_seconds AS durationSeconds
+    FROM music_tracks WHERE is_active = 1 ORDER BY sort_order ASC
+  `).all();
+  res.json({ tracks });
 });
 
 /* =========================================================================
