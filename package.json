@@ -21,6 +21,7 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.1",
     "google-auth-library": "^9.14.1",
+    "livekit-server-sdk": "^2.9.2",
     "socket.io": "^4.7.5",
     "uuid": "^9.0.1"
   }

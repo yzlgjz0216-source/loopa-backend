@@ -347,6 +347,27 @@ db.exec(`
     FOREIGN KEY (blocker_id) REFERENCES users(id),
     FOREIGN KEY (blocked_id) REFERENCES users(id)
   );
+
+  -- 直播间表(本轮新增,直播功能 Phase 0/1):一场直播从开播到结束是一行记录。
+  -- room_name 是传给 LiveKit(以及以后如果切换到别家RTC服务商)的房间标识,
+  -- 和 id 分开存是为了以后即使房间命名规则要改,也不影响 livestreams.id 这个
+  -- 对外稳定的主键。provider 先固定写 'livekit',预留字段是为了以后如果真的
+  -- 切换/对比服务商,不用改表结构。peak_viewer_count 只是一个粗略统计,不是
+  -- 精确的实时在线人数来源(实时人数由 Socket.io 房间连接数现场计算)。
+  CREATE TABLE IF NOT EXISTS livestreams (
+    id TEXT PRIMARY KEY,
+    host_id TEXT NOT NULL,
+    room_name TEXT NOT NULL UNIQUE,
+    provider TEXT NOT NULL DEFAULT 'livekit',
+    title TEXT,
+    status TEXT NOT NULL DEFAULT 'live' CHECK(status IN ('live', 'ended')),
+    peak_viewer_count INTEGER NOT NULL DEFAULT 0,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    FOREIGN KEY (host_id) REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_livestreams_status ON livestreams(status, started_at);
+  CREATE INDEX IF NOT EXISTS idx_livestreams_host ON livestreams(host_id, started_at);
 `);
 
 // 兼容性迁移:如果是从旧版本升级上来的数据库,users表可能缺少这些新增字段,

@@ -78,6 +78,7 @@ const { v4: uuidv4 } = require("uuid");
 const rateLimit = require("express-rate-limit");
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const { AccessToken: LiveKitAccessToken } = require("livekit-server-sdk");
 const db = require("./db");
 
 /* =========================================================================
@@ -209,6 +210,28 @@ const ACCESS_TOKEN_TTL_SECONDS = 15 * 60; // 15分钟
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30天
 const REQUIRE_VIDEO_REVIEW = String(process.env.REQUIRE_VIDEO_REVIEW || "").toLowerCase() === "true";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
+// 直播功能(本轮新增,Phase 0 技术验证优先接入 LiveKit):三个变量任一没配置,
+// /api/livestreams/* 接口会直接返回 503,不会让服务整体崩溃启动失败——
+// 直播是可选功能,没配置密钥之前不影响其它功能正常使用。
+const LIVEKIT_URL = process.env.LIVEKIT_URL || "";
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || "";
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || "";
+async function buildLiveKitToken(identity, displayName, roomName, { canPublish }) {
+  const at = new LiveKitAccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+    identity,
+    name: displayName || identity,
+    ttl: "6h",
+  });
+  at.addGrant({
+    room: roomName,
+    roomJoin: true,
+    canPublish: !!canPublish,
+    canPublishData: true, // 用于以后如果要用 LiveKit 自带的数据通道做礼物动效同步(Phase 4)
+    canSubscribe: true,
+  });
+  return at.toJwt();
+}
 
 // Cloudflare R2 是 S3 兼容的对象存储,用同一套 AWS SDK 就能对接,只是换了 endpoint
 const r2 = new S3Client({
@@ -1718,6 +1741,138 @@ app.post("/api/conversations/:id/clear", requireAuth, (req, res) => {
 });
 
 /* =========================================================================
+   直播功能(本轮新增,对应"直播功能_技术方案与开发计划"文档的 Phase 0+1+2):
+   主播开播/结束、直播广场列表、观众加入。音视频推拉流走 LiveKit(第三方
+   RTC云服务),这里的接口只负责"发一个有权限的房间令牌"和"记录一场直播的
+   生命周期",真正的音视频数据不经过我们自己的服务器。
+   聊天/点赞飘心复用下面 Socket.io 里的 `live:${livestreamId}` 房间,不在这里。
+   礼物系统、禁言/踢人、未成年人限制等还没做(见开发计划里 Phase 4/5),
+   现在这一批先把"能开播、能看、能聊天、能点赞飘心"这个最小闭环跑通,
+   重点是在 Pi Browser 里实测这条链路到底通不通、体验怎么样。
+   ========================================================================= */
+function requireLiveKitConfigured(req, res, next) {
+  if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+    return res.status(503).json({ error: "直播服务尚未配置(缺少 LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET),请先在 .env 里填好" });
+  }
+  next();
+}
+
+// 主播开播:创建一条直播记录,签发一个"可以推流"的 LiveKit token
+app.post("/api/livestreams/start", requireAuth, requireLiveKitConfigured, async (req, res) => {
+  try {
+    // 同一个账号不允许同时开两场直播——如果有一场还挂在 live 状态,直接把它的信息返回,
+    // 而不是报错,这样"忘了结束、直接刷新页面重新点开播"的常见情况能自动接回上一场。
+    const existing = db.prepare(
+      "SELECT id, room_name, title, started_at FROM livestreams WHERE host_id = ? AND status = 'live'"
+    ).get(req.userId);
+    const user = db.prepare("SELECT id, username, display_name, avatar_url FROM users WHERE id = ?").get(req.userId);
+    if (!user) return res.status(404).json({ error: "账号不存在" });
+
+    if (existing) {
+      const token = await buildLiveKitToken(req.userId, user.display_name || user.username, existing.room_name, { canPublish: true });
+      return res.json({
+        livestream: {
+          id: existing.id, roomName: existing.room_name, title: existing.title, status: "live", startedAt: existing.started_at,
+          host: { id: user.id, username: user.username, displayName: user.display_name, avatarUrl: user.avatar_url },
+        },
+        wsUrl: LIVEKIT_URL,
+        token,
+        resumed: true,
+      });
+    }
+
+    const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 100) : "";
+    const id = uuidv4();
+    const roomName = `live_${id}`;
+    const now = Date.now();
+    db.prepare(`
+      INSERT INTO livestreams (id, host_id, room_name, provider, title, status, peak_viewer_count, started_at)
+      VALUES (?, ?, ?, 'livekit', ?, 'live', 0, ?)
+    `).run(id, req.userId, roomName, title || null, now);
+
+    const token = await buildLiveKitToken(req.userId, user.display_name || user.username, roomName, { canPublish: true });
+    res.json({
+      livestream: {
+        id, roomName, title: title || null, status: "live", startedAt: now,
+        host: { id: user.id, username: user.username, displayName: user.display_name, avatarUrl: user.avatar_url },
+      },
+      wsUrl: LIVEKIT_URL,
+      token,
+      resumed: false,
+    });
+  } catch (err) {
+    console.error("[POST /api/livestreams/start] 出错:", err);
+    res.status(500).json({ error: "开播失败,请稍后重试" });
+  }
+});
+
+// 主播结束直播(幂等:重复调用不报错)
+app.post("/api/livestreams/:id/end", requireAuth, (req, res) => {
+  const live = db.prepare("SELECT id, host_id, status FROM livestreams WHERE id = ?").get(req.params.id);
+  if (!live) return res.status(404).json({ error: "直播不存在" });
+  if (live.host_id !== req.userId) return res.status(403).json({ error: "只有主播本人能结束这场直播" });
+  if (live.status !== "ended") {
+    db.prepare("UPDATE livestreams SET status = 'ended', ended_at = ? WHERE id = ?").run(Date.now(), req.params.id);
+  }
+  io.to(`live:${req.params.id}`).emit("live_ended", { livestreamId: req.params.id });
+  res.json({ ok: true });
+});
+
+// 直播广场:当前正在直播的列表(在线人数是现场从 Socket.io 房间人数里读的,不是查表)
+app.get("/api/livestreams/live", optionalAuth, (req, res) => {
+  const rows = db.prepare(`
+    SELECT l.id, l.title, l.started_at,
+           u.id AS host_id, u.username AS host_username, u.display_name AS host_display_name, u.avatar_url AS host_avatar_url
+    FROM livestreams l
+    JOIN users u ON u.id = l.host_id
+    WHERE l.status = 'live'
+    ORDER BY l.started_at DESC
+    LIMIT 50
+  `).all();
+  const list = rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    startedAt: r.started_at,
+    viewerCount: io.sockets.adapter.rooms.get(`live:${r.id}`)?.size || 0,
+    host: { id: r.host_id, username: r.host_username, displayName: r.host_display_name, avatarUrl: r.host_avatar_url },
+  }));
+  res.json({ livestreams: list });
+});
+
+// 观众加入直播间:签发一个"只能拉流看、不能推流"的 LiveKit token。
+// 如果是主播本人调用这个接口(比如主播端页面刷新了),照样给推流权限。
+app.post("/api/livestreams/:id/join", requireAuth, requireLiveKitConfigured, async (req, res) => {
+  try {
+    const live = db.prepare(`
+      SELECT l.id, l.room_name, l.status, l.title, l.started_at,
+             u.id AS host_id, u.username AS host_username, u.display_name AS host_display_name, u.avatar_url AS host_avatar_url
+      FROM livestreams l JOIN users u ON u.id = l.host_id
+      WHERE l.id = ?
+    `).get(req.params.id);
+    if (!live) return res.status(404).json({ error: "直播不存在" });
+    if (live.status !== "live") return res.status(410).json({ error: "这场直播已经结束了" });
+
+    const viewer = db.prepare("SELECT id, username, display_name FROM users WHERE id = ?").get(req.userId);
+    if (!viewer) return res.status(404).json({ error: "账号不存在" });
+    const canPublish = live.host_id === req.userId;
+    const token = await buildLiveKitToken(req.userId, viewer.display_name || viewer.username, live.room_name, { canPublish });
+
+    res.json({
+      livestream: {
+        id: live.id, roomName: live.room_name, title: live.title, startedAt: live.started_at,
+        host: { id: live.host_id, username: live.host_username, displayName: live.host_display_name, avatarUrl: live.host_avatar_url },
+      },
+      wsUrl: LIVEKIT_URL,
+      token,
+      isHost: canPublish,
+    });
+  } catch (err) {
+    console.error("[POST /api/livestreams/:id/join] 出错:", err);
+    res.status(500).json({ error: "加入直播间失败,请稍后重试" });
+  }
+});
+
+/* =========================================================================
    Socket.io 实时消息推送
 
    ⚠️ 本轮核心修复:不再有自由声明身份的 `identify` 事件。身份验证挪到
@@ -1787,8 +1942,80 @@ io.on("connection", (socket) => {
     }
   });
 
+  // -----------------------------------------------------------------------
+  // 直播间(本轮新增):聊天消息 + 点赞飘心,走同一条 socket 连接,
+  // 用 `live:${livestreamId}` 房间隔离,和私信/群聊的 `user:${userId}` 房间
+  // 互不影响。真正的音视频画面/声音不走这条通道,走 LiveKit。
+  // -----------------------------------------------------------------------
+  socket.on("join_live_room", ({ livestreamId } = {}, ack) => {
+    try {
+      if (!livestreamId) return ack && ack({ error: "缺少 livestreamId" });
+      const live = db.prepare("SELECT id, status FROM livestreams WHERE id = ?").get(livestreamId);
+      if (!live || live.status !== "live") return ack && ack({ error: "直播不存在或已结束" });
+      socket.join(`live:${livestreamId}`);
+      socket.data.currentLiveRoom = livestreamId;
+      const viewerCount = io.sockets.adapter.rooms.get(`live:${livestreamId}`)?.size || 0;
+      // 峰值人数只是个粗略统计(给主播/后台看个大概),不是精确的实时在线来源
+      db.prepare("UPDATE livestreams SET peak_viewer_count = MAX(peak_viewer_count, ?) WHERE id = ?").run(viewerCount, livestreamId);
+      io.to(`live:${livestreamId}`).emit("live_viewer_count", { livestreamId, viewerCount });
+      ack && ack({ ok: true, viewerCount });
+    } catch (err) {
+      console.error("[socket join_live_room] 出错:", err);
+      ack && ack({ error: "加入直播间失败" });
+    }
+  });
+
+  socket.on("leave_live_room", ({ livestreamId } = {}) => {
+    if (!livestreamId) return;
+    socket.leave(`live:${livestreamId}`);
+    if (socket.data.currentLiveRoom === livestreamId) socket.data.currentLiveRoom = null;
+    const viewerCount = io.sockets.adapter.rooms.get(`live:${livestreamId}`)?.size || 0;
+    io.to(`live:${livestreamId}`).emit("live_viewer_count", { livestreamId, viewerCount });
+  });
+
+  socket.on("live_chat_message", ({ livestreamId, content } = {}, ack) => {
+    try {
+      if (!livestreamId || typeof content !== "string" || !content.trim()) return ack && ack({ error: "内容不能为空" });
+      if (!socket.rooms.has(`live:${livestreamId}`)) return ack && ack({ error: "还没有加入这个直播间" });
+      const trimmed = content.trim().slice(0, 300);
+      const sender = db.prepare("SELECT id, username, display_name, avatar_url FROM users WHERE id = ?").get(socket.data.userId);
+      const payload = {
+        livestreamId,
+        id: uuidv4(),
+        content: trimmed,
+        createdAt: Date.now(),
+        sender: sender
+          ? { id: sender.id, username: sender.username, displayName: sender.display_name, avatarUrl: sender.avatar_url }
+          : { id: socket.data.userId },
+      };
+      io.to(`live:${livestreamId}`).emit("live_chat_message", payload);
+      ack && ack({ ok: true });
+    } catch (err) {
+      console.error("[socket live_chat_message] 出错:", err);
+      ack && ack({ error: "发送失败" });
+    }
+  });
+
+  // 点赞飘心:纯前端动效用的信号,不落库,只做一个简单的按连接节流,防止连点刷屏
+  socket.on("live_heart", ({ livestreamId } = {}) => {
+    if (!livestreamId) return;
+    if (!socket.rooms.has(`live:${livestreamId}`)) return;
+    const now = Date.now();
+    if (socket.data.lastHeartAt && now - socket.data.lastHeartAt < 150) return;
+    socket.data.lastHeartAt = now;
+    io.to(`live:${livestreamId}`).emit("live_heart", { livestreamId, userId: socket.data.userId });
+  });
+
   socket.on("disconnect", () => {
     // 预留:可在这里做"最后在线时间"更新等逻辑
+    if (socket.data.currentLiveRoom) {
+      const livestreamId = socket.data.currentLiveRoom;
+      // 等 socket 真正从房间里移除之后再统计人数,避免把自己也算进"离开后还剩几人"里
+      setImmediate(() => {
+        const viewerCount = io.sockets.adapter.rooms.get(`live:${livestreamId}`)?.size || 0;
+        io.to(`live:${livestreamId}`).emit("live_viewer_count", { livestreamId, viewerCount });
+      });
+    }
   });
 });
 
@@ -1800,4 +2027,5 @@ server.listen(PORT, () => {
   console.log(`RESEND_API_KEY: ${RESEND_API_KEY ? "已配置" : "⚠️ 未配置,邮箱验证码仅打印到日志"}`);
   console.log(`CORS_ALLOWED_ORIGINS: ${allowedOrigins.length ? allowedOrigins.join(", ") : "⚠️ 未配置,当前允许任意来源"}`);
   console.log(`REQUIRE_VIDEO_REVIEW: ${REQUIRE_VIDEO_REVIEW}`);
+  console.log(`LIVEKIT: ${LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET ? "已配置" : "⚠️ 未配置,直播相关接口会返回 503"}`);
 });
