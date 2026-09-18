@@ -451,4 +451,15 @@ for (const { name, col } of uniqueIdentityIndexes) {
   }
 }
 
+// 本轮新增:"清空聊天记录"功能用的字段——只想清空自己这一侧看到的历史消息,
+// 不影响对方,所以不能物理删除 messages 表里的记录,而是给每个会话成员单独记一个
+// "清空到什么时间点"的时间戳,查消息列表时只要求 created_at > cleared_before 即可。
+try {
+  db.exec(`ALTER TABLE conversation_members ADD COLUMN cleared_before INTEGER DEFAULT 0`);
+} catch (e) {
+  if (!/duplicate column name/i.test(e.message)) {
+    console.error(`[db migration] conversation_members 表添加 cleared_before 失败:`, e.message);
+  }
+}
+
 module.exports = db;

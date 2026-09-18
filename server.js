@@ -1208,7 +1208,34 @@ app.get("/api/users/:id/stats", (req, res) => {
   const likeCount = db.prepare(
     "SELECT COALESCE(SUM(like_count), 0) AS c FROM videos WHERE creator_id = ? AND status = 'published'"
   ).get(req.params.id).c;
-  res.json({ followingCount, followerCount, likeCount });
+  // 本轮新增:互相关注的人数(A关注了B,B也关注了A),配合前端主页新增的"互关"
+  // 入口——之前只有 关注/粉丝/获赞 三个统计,想看"和我互相关注的都有谁"只能
+  // 分别翻关注列表和粉丝列表、自己肉眼去对,现在直接给一个数、点进去是筛好的名单。
+  const mutualCount = db.prepare(`
+    SELECT COUNT(*) AS c FROM follows f1
+    WHERE f1.follower_id = ?
+      AND EXISTS (SELECT 1 FROM follows f2 WHERE f2.follower_id = f1.creator_id AND f2.creator_id = f1.follower_id)
+  `).get(req.params.id).c;
+  res.json({ followingCount, followerCount, likeCount, mutualCount });
+});
+
+// 本轮新增:互相关注名单——上面 mutualCount 对应的完整列表,给主页新的"互关"
+// 入口点开用。复用 followers/following-list 同样的返回结构(id/username/
+// displayName/avatarUrl/isMutual),isMutual 这里永远是 true,保留字段只是
+// 为了和 FollowListSheet 现成的渲染逻辑保持一致,不用为这一个场景单独写模板。
+app.get("/api/users/:id/mutual-follows", (req, res) => {
+  const rows = db.prepare(`
+    SELECT u.id, u.username, u.display_name, u.avatar_url
+    FROM follows f1
+    JOIN users u ON u.id = f1.creator_id
+    WHERE f1.follower_id = ?
+      AND EXISTS (SELECT 1 FROM follows f2 WHERE f2.follower_id = f1.creator_id AND f2.creator_id = f1.follower_id)
+    ORDER BY f1.created_at DESC
+  `).all(req.params.id);
+  res.json(rows.map((r) => ({
+    id: r.id, username: r.username, displayName: r.display_name || r.username, avatarUrl: r.avatar_url,
+    isMutual: true,
+  })));
 });
 
 // 本轮新增:粉丝列表(之前只有"我关注了谁"的接口,没有"谁关注了我")。
@@ -1431,10 +1458,18 @@ app.post("/api/videos/:id/comments", requireAuth, commentLimiter, (req, res) => 
 // 只有修改"自己"资料的 PATCH。导致点开别人主页时("访客模式"),前端连问都没地方问,
 // 只能一直显示占位头像和 Feed 卡片里可能已经过期的旧昵称,改了资料对方也看不到更新。
 // 不要求登录(和查看别人的公开作品一样,谁都能看),只返回公开字段。
-app.get("/api/users/:id", (req, res) => {
+// 本轮新增 optionalAuth:如果请求带了登录态,顺便算出"这个被访问的人是不是也关注了我"
+// (followsMe),配合前端在对方主页的关注按钮上显示"互相关注"状态——之前这个接口
+// 完全不管请求者是谁,前端拿不到这个信息,关注按钮永远只有"关注"/"已关注"两种状态。
+app.get("/api/users/:id", optionalAuth, (req, res) => {
   const user = db.prepare("SELECT id, username, display_name, avatar_url, background_url, age_tier, bio FROM users WHERE id = ?").get(req.params.id);
   if (!user) return res.status(404).json({ error: "用户不存在" });
-  res.json(publicUserView(user));
+  const view = publicUserView(user);
+  if (req.userId && req.userId !== user.id) {
+    const followsMe = !!db.prepare("SELECT 1 FROM follows WHERE follower_id = ? AND creator_id = ?").get(user.id, req.userId);
+    view.followsMe = followsMe;
+  }
+  res.json(view);
 });
 
 app.patch("/api/users/:id", requireAuth, (req, res) => {
@@ -1526,18 +1561,35 @@ app.get("/api/users/me/blocked", requireAuth, (req, res) => {
 /* =========================================================================
    会话(私信/群聊)
    ========================================================================= */
+// 本轮修复:之前这个接口对一对一私信(type='direct')完全没有返回对方的用户名/头像
+// ——c.group_name/c.group_avatar_url 只有群聊会有值,一对一私信这两个字段永远是 NULL,
+// 导致前端会话列表只能显示兜底文案"对话"和一个空的头像圆圈,用户完全看不出这条
+// 私信是跟谁聊的。这里补一个 LEFT JOIN 找出"这个会话里除了我之外的另一个成员",
+// 把TA的用户名/昵称/头像也一起查出来,直接在 direct 类型的会话上用它兜底。
 app.get("/api/conversations", requireAuth, (req, res) => {
   const rows = db.prepare(`
     SELECT c.id, c.type, c.group_name, c.group_avatar_url,
       (SELECT content FROM messages WHERE conversation_id = c.id AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1) AS last_message,
       (SELECT created_at FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
-      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.created_at > cm.last_read_at) AS unread_count
+      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.created_at > cm.last_read_at) AS unread_count,
+      ou.id AS other_user_id, ou.username AS other_username, ou.display_name AS other_display_name, ou.avatar_url AS other_avatar_url
     FROM conversations c
     JOIN conversation_members cm ON cm.conversation_id = c.id
+    LEFT JOIN conversation_members ocm ON ocm.conversation_id = c.id AND ocm.user_id != ?
+    LEFT JOIN users ou ON ou.id = ocm.user_id AND c.type = 'direct'
     WHERE cm.user_id = ?
     ORDER BY last_message_at DESC
-  `).all(req.userId);
-  res.json(rows);
+  `).all(req.userId, req.userId);
+  res.json(rows.map((r) => ({
+    id: r.id,
+    type: r.type,
+    name: r.type === "direct" ? (r.other_display_name || r.other_username || null) : r.group_name,
+    avatarUrl: r.type === "direct" ? r.other_avatar_url : r.group_avatar_url,
+    otherUserId: r.type === "direct" ? r.other_user_id : null,
+    last_message: r.last_message,
+    last_message_at: r.last_message_at,
+    unread_count: r.unread_count,
+  })));
 });
 
 // 本轮新增:私信入口的小红点角标要用——把这个人所有会话里的未读消息数加起来,
@@ -1615,18 +1667,53 @@ app.get("/api/conversations/:id/messages", requireAuth, (req, res) => {
   const before = Number(req.query.before) || Date.now();
   const limit = Math.min(Number(req.query.limit) || 30, 100);
 
-  const isMember = db.prepare("SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?").get(id, req.userId);
-  if (!isMember) return res.status(403).json({ error: "你不是该会话成员" });
+  const member = db.prepare("SELECT cleared_before FROM conversation_members WHERE conversation_id = ? AND user_id = ?").get(id, req.userId);
+  if (!member) return res.status(403).json({ error: "你不是该会话成员" });
 
+  // 本轮修复:之前这里 SELECT * 会把撤回/删除的消息(deleted_at 不为空)也一起
+  // 返回,前端并没有处理这种情况,结果撤回后的消息内容原样还在界面上,等于
+  // "删除"完全没生效。现在过滤掉已删除的,同时用 cleared_before 支持
+  // "清空聊天记录"——清空只影响我自己这一侧看到的历史,不影响对方。
   const messages = db.prepare(`
-    SELECT * FROM messages WHERE conversation_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?
-  `).all(id, before, limit);
+    SELECT * FROM messages
+    WHERE conversation_id = ? AND created_at < ? AND created_at > ? AND deleted_at IS NULL
+    ORDER BY created_at DESC LIMIT ?
+  `).all(id, before, member.cleared_before || 0, limit);
   res.json(messages.reverse());
 });
 
 app.post("/api/conversations/:id/read", requireAuth, (req, res) => {
   db.prepare("UPDATE conversation_members SET last_read_at = ? WHERE conversation_id = ? AND user_id = ?")
     .run(Date.now(), req.params.id, req.userId);
+  res.json({ ok: true });
+});
+
+// 本轮新增:删除单条消息(撤回)。只允许发送者本人删除,软删除(deleted_at)
+// 不物理删掉记录,方便日后申诉/审计;删除后消息就不会再出现在
+// GET /api/conversations/:id/messages 的结果里。
+app.delete("/api/conversations/:id/messages/:messageId", requireAuth, (req, res) => {
+  const { id, messageId } = req.params;
+  const isMember = db.prepare("SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?").get(id, req.userId);
+  if (!isMember) return res.status(403).json({ error: "你不是该会话成员" });
+  const message = db.prepare("SELECT id, sender_id FROM messages WHERE id = ? AND conversation_id = ?").get(messageId, id);
+  if (!message) return res.status(404).json({ error: "消息不存在" });
+  if (message.sender_id !== req.userId) return res.status(403).json({ error: "只能删除自己发送的消息" });
+  db.prepare("UPDATE messages SET deleted_at = ? WHERE id = ?").run(Date.now(), messageId);
+  io.to(`user:${req.userId}`).emit("message_deleted", { conversationId: id, messageId });
+  // 通知对方那一侧也把这条消息去掉,避免出现"我这边删了、对方那边还在"的不一致
+  const otherMembers = db.prepare("SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id != ?").all(id, req.userId);
+  otherMembers.forEach((m) => io.to(`user:${m.user_id}`).emit("message_deleted", { conversationId: id, messageId }));
+  res.json({ ok: true });
+});
+
+// 本轮新增:清空聊天记录。只清空"我"这一侧从现在往前看到的历史(把
+// cleared_before 设成当前时间),不删除消息本身、不影响对方看到的记录——
+// 和主流 IM 产品"清空聊天记录只清自己这边"的行为一致。
+app.post("/api/conversations/:id/clear", requireAuth, (req, res) => {
+  const isMember = db.prepare("SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?").get(req.params.id, req.userId);
+  if (!isMember) return res.status(403).json({ error: "你不是该会话成员" });
+  db.prepare("UPDATE conversation_members SET cleared_before = ?, last_read_at = ? WHERE conversation_id = ? AND user_id = ?")
+    .run(Date.now(), Date.now(), req.params.id, req.userId);
   res.json({ ok: true });
 });
 
