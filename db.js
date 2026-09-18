@@ -221,6 +221,51 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(video_id, created_at);
 
+  -- 收藏表(本轮新增):之前"收藏"只存在用户自己浏览器的本地缓存里,换设备/清缓存
+  -- 就没了,后端压根没这张表。现在改成和点赞/关注一样,是服务端真正持久化的关系,
+  -- 才能在"个人资料 → 收藏"这个新标签页里展示,换设备登录也能看到。
+  CREATE TABLE IF NOT EXISTS collections (
+    user_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, video_id),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (video_id) REFERENCES videos(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_collections_user ON collections(user_id, created_at);
+
+  -- 观看历史表(本轮新增):记录一个账号看过哪些视频、最近一次看的时间。
+  -- 用 (user_id, video_id) 联合主键,同一条视频反复看只更新 watched_at,
+  -- "历史浏览"这个新标签页里不会因为反复看同一条视频而堆出好多条重复记录。
+  CREATE TABLE IF NOT EXISTS watch_history (
+    user_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    watched_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, video_id),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (video_id) REFERENCES videos(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_watch_history_user ON watch_history(user_id, watched_at);
+
+  -- 通知表(本轮新增):平台/其他用户与这个账号之间的"提示信息"统一存这里——
+  -- 有人赞了/评论了/关注了你(actor_id 是触发这条通知的人),或者是平台方发的
+  -- 系统公告(type='system',actor_id 为空)。有了这张表,个人资料/首页才能有一个
+  -- "通知"入口,把这些原来完全没有留痕、看不到历史的提示统一展示出来。
+  CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,         -- 通知给谁看
+    type TEXT NOT NULL CHECK(type IN ('like', 'comment', 'follow', 'tip', 'system')),
+    actor_id TEXT,                 -- 触发这条通知的人(系统公告没有,为空)
+    video_id TEXT,                 -- 关联的视频(点赞/评论通知才有,可为空)
+    content TEXT,                  -- 系统公告的正文,或者评论通知里附带的评论内容摘要
+    created_at INTEGER NOT NULL,
+    read_at INTEGER,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (actor_id) REFERENCES users(id),
+    FOREIGN KEY (video_id) REFERENCES videos(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at);
+
   /* =======================================================================
      以下均为本轮(安全加固)新增的表
      ======================================================================= */

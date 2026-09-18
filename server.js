@@ -382,6 +382,19 @@ function issueTokenPair(userId) {
   return { accessToken, refreshToken, expiresIn: ACCESS_TOKEN_TTL_SECONDS };
 }
 
+// 本轮新增:统一的"发一条通知"辅助函数——有人赞了/评论了/关注了/打赏了你,
+// 或者平台方要发系统公告,都通过它写进 notifications 表。特意加了两个防噪音的判断:
+// 不给自己发通知(比如自己给自己的作品点赞、自己评论自己的作品,这种不需要提醒);
+// 系统公告(type='system')允许 actorId 为空。
+function createNotification({ userId, type, actorId = null, videoId = null, content = null }) {
+  if (!userId) return;
+  if (actorId && actorId === userId) return; // 不给自己发通知
+  db.prepare(`
+    INSERT INTO notifications (id, user_id, type, actor_id, video_id, content, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(uuidv4(), userId, type, actorId, videoId, content, Date.now());
+}
+
 function publicUserView(user) {
   return {
     id: user.id,
@@ -860,7 +873,7 @@ app.post("/api/payments/complete", requireAuth, paymentLimiter, async (req, res)
           return;
         }
 
-        const tip = db.prepare("SELECT amount, amount_units, creator_user_id, creator_name FROM tips WHERE payment_id = ?").get(paymentId);
+        const tip = db.prepare("SELECT amount, amount_units, creator_user_id, creator_name, buyer_user_id FROM tips WHERE payment_id = ?").get(paymentId);
         if (!tip) return;
 
         // 旧表(按显示名),继续写入只作历史兼容展示
@@ -883,6 +896,14 @@ app.post("/api/payments/complete", requireAuth, paymentLimiter, async (req, res)
               updated_at = excluded.updated_at
           `).run(tip.creator_user_id, tip.creator_name, tip.amount_units || 0, Date.now());
         }
+
+        // 打赏到账,给创作者发一条通知(本轮新增)。
+        if (tip.creator_user_id) {
+          createNotification({
+            userId: tip.creator_user_id, type: "tip", actorId: tip.buyer_user_id || null,
+            content: `收到 ${tip.amount} PI 打赏`,
+          });
+        }
       });
       tx();
     } catch (dbErr) {
@@ -896,8 +917,26 @@ app.post("/api/payments/complete", requireAuth, paymentLimiter, async (req, res)
   }
 });
 
+// 本轮新增:直接按账号 ID 查创作者收益——之前只有按"名字"查的 /api/creators/:name/balance,
+// 前端实际传的是可以改的昵称(displayName),不是不会变的 username,两者一旦不一致就查
+// 不到人,导致明明收到了打赏,收益页却一直显示"还没收到任何打赏"。ID 是唯一、不会变的,
+// 不存在这个问题,前端个人资料页的"创作者收益"标签页改成调这个接口。
+app.get("/api/users/:id/balance", (req, res) => {
+  const balanceV2 = db.prepare(
+    "SELECT total_pi_units, tip_count, updated_at FROM creator_balances_v2 WHERE creator_user_id = ?"
+  ).get(req.params.id);
+  if (!balanceV2) return res.json({ total_pi: 0, tip_count: 0, updated_at: null });
+  res.json({
+    total_pi: balanceV2.total_pi_units / 10000000,
+    tip_count: balanceV2.tip_count,
+    updated_at: balanceV2.updated_at,
+  });
+});
+
 // 查询某个创作者的累计打赏收益。优先用 creator_user_id(v2表,真正的记账依据),
 // 传的是 username 时先查出对应的 user id 再查,兼容前端仍按用户名展示的场景。
+// ⚠️ 保留这个按名字查的旧接口只是为了兼容可能还在用它的旧调用方,新代码一律用
+// 上面按 ID 查的 /api/users/:id/balance,不要再依赖这个。
 app.get("/api/creators/:name/balance", (req, res) => {
   const { name } = req.params;
   const user = db.prepare("SELECT id FROM users WHERE username = ?").get(name);
@@ -1027,6 +1066,27 @@ app.delete("/api/videos/:id", requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// 记一次播放(本轮新增)——之前这个字段从视频发布那一刻起就没被更新过,不管多少人
+// 看过都停在初始值 0。这里做的是最基础的版本:前端在一条视频真正开始播放时调用一次,
+// 不做"有效观看时长"这类精细统计,只做一个简单的节流:同一个客户端对同一条视频,
+// 短时间内重复触发不重复计数(节流逻辑在下面 videoViewThrottle 里,按内存记,重启会清空,
+// 足够应付"防止划一下计好几次"这种基本场景,严格防刷后续可以再加)。
+const videoViewThrottle = new Map(); // key: `${clientKey}:${videoId}` -> 上次计数的时间戳
+const VIEW_THROTTLE_MS = 60 * 1000;
+app.post("/api/videos/:id/view", optionalAuth, (req, res) => {
+  const videoId = req.params.id;
+  const clientKey = req.userId || req.ip || "anon";
+  const throttleKey = `${clientKey}:${videoId}`;
+  const now = Date.now();
+  const last = videoViewThrottle.get(throttleKey);
+  if (last && now - last < VIEW_THROTTLE_MS) {
+    return res.json({ ok: true, counted: false });
+  }
+  videoViewThrottle.set(throttleKey, now);
+  db.prepare("UPDATE videos SET view_count = view_count + 1 WHERE id = ?").run(videoId);
+  res.json({ ok: true, counted: true });
+});
+
 app.get("/api/videos/user/:creatorId", (req, res) => {
   // creator_id 本轮补进返回字段:前端"作品"弹层需要靠它判断当前浏览的是不是
   // 自己的作品,来决定要不要显示删除按钮——之前这里没有返回这个字段。
@@ -1071,7 +1131,7 @@ app.post("/api/videos/:id/like", requireAuth, (req, res) => {
   const { id: videoId } = req.params;
   const userId = req.userId;
 
-  const video = db.prepare("SELECT id, like_count FROM videos WHERE id = ?").get(videoId);
+  const video = db.prepare("SELECT id, creator_id, like_count FROM videos WHERE id = ?").get(videoId);
   if (!video) return res.status(404).json({ error: "视频不存在" });
 
   const existing = db.prepare("SELECT 1 FROM likes WHERE video_id = ? AND user_id = ?").get(videoId, userId);
@@ -1086,6 +1146,11 @@ app.post("/api/videos/:id/like", requireAuth, (req, res) => {
   });
   tx();
 
+  // 点赞(不是取消点赞)时给视频作者发一条通知——本轮新增,之前点赞完全不会留下任何提示。
+  if (!existing) {
+    createNotification({ userId: video.creator_id, type: "like", actorId: userId, videoId });
+  }
+
   const updated = db.prepare("SELECT like_count FROM videos WHERE id = ?").get(videoId);
   res.json({ liked: !existing, likeCount: updated.like_count });
 });
@@ -1093,6 +1158,23 @@ app.post("/api/videos/:id/like", requireAuth, (req, res) => {
 app.get("/api/users/:userId/likes", (req, res) => {
   const rows = db.prepare("SELECT video_id FROM likes WHERE user_id = ?").all(req.params.userId);
   res.json(rows.map((r) => r.video_id));
+});
+
+// 本轮新增:我点赞过的作品完整列表(个人资料"喜欢"标签页用)——上面那个 /likes
+// 接口只返回一串 video_id,是给 UserSocialState 内部判断"这条我有没有点过赞"用的,
+// 不要改动它的返回格式;这个新接口专门给"喜欢"这个标签页用,返回完整视频信息,
+// 才能渲染出可以点开连续播放的九宫格(之前"喜欢"标签页其实一直显示的是假的占位数据,
+// 点了没反应,根源就是压根没有对接真实接口)。
+app.get("/api/users/me/liked-videos", requireAuth, (req, res) => {
+  const videos = db.prepare(`
+    SELECT v.id, v.creator_id, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
+           (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
+    FROM likes l
+    JOIN videos v ON v.id = l.video_id
+    WHERE l.user_id = ? AND v.status = 'published'
+    ORDER BY l.created_at DESC
+  `).all(req.userId);
+  res.json(videos);
 });
 
 app.post("/api/users/:id/follow", requireAuth, (req, res) => {
@@ -1105,6 +1187,8 @@ app.post("/api/users/:id/follow", requireAuth, (req, res) => {
     db.prepare("DELETE FROM follows WHERE follower_id = ? AND creator_id = ?").run(followerId, creatorId);
   } else {
     db.prepare("INSERT INTO follows (follower_id, creator_id, created_at) VALUES (?, ?, ?)").run(followerId, creatorId, Date.now());
+    // 新关注(不是取消关注)时给对方发一条通知——本轮新增。
+    createNotification({ userId: creatorId, type: "follow", actorId: followerId });
   }
 
   const followerCount = db.prepare("SELECT COUNT(*) AS c FROM follows WHERE creator_id = ?").get(creatorId).c;
@@ -1116,24 +1200,205 @@ app.get("/api/users/:userId/following", (req, res) => {
   res.json(rows.map((r) => r.creator_id));
 });
 
+// 本轮新增:个人资料页顶部"关注/粉丝/获赞"三个数字之前是写死在页面里的假数据,
+// 这里补上真实统计——关注数、粉丝数、获赞数(这个人所有已发布作品的点赞数加总)。
+app.get("/api/users/:id/stats", (req, res) => {
+  const followingCount = db.prepare("SELECT COUNT(*) AS c FROM follows WHERE follower_id = ?").get(req.params.id).c;
+  const followerCount = db.prepare("SELECT COUNT(*) AS c FROM follows WHERE creator_id = ?").get(req.params.id).c;
+  const likeCount = db.prepare(
+    "SELECT COALESCE(SUM(like_count), 0) AS c FROM videos WHERE creator_id = ? AND status = 'published'"
+  ).get(req.params.id).c;
+  res.json({ followingCount, followerCount, likeCount });
+});
+
+// 本轮新增:粉丝列表(之前只有"我关注了谁"的接口,没有"谁关注了我")。
+// is_followed_back 标记这个人是不是也被主页主人关注了——用来在列表里显示"互相关注"标签。
+app.get("/api/users/:id/followers", (req, res) => {
+  const rows = db.prepare(`
+    SELECT u.id, u.username, u.display_name, u.avatar_url,
+           EXISTS(SELECT 1 FROM follows WHERE follower_id = ? AND creator_id = u.id) AS is_followed_back
+    FROM follows f
+    JOIN users u ON u.id = f.follower_id
+    WHERE f.creator_id = ?
+    ORDER BY f.created_at DESC
+  `).all(req.params.id, req.params.id);
+  res.json(rows.map((r) => ({
+    id: r.id, username: r.username, displayName: r.display_name || r.username, avatarUrl: r.avatar_url,
+    isMutual: !!r.is_followed_back,
+  })));
+});
+
+// 本轮新增:和上面的 /following(只返回 id 数组,是给 UserSocialState 内部用的,
+// 不要改动它的返回格式,前端已经依赖它是纯 id 数组了)不同,这个接口返回完整的用户信息,
+// 专门给"关注列表"这个新页面用。
+app.get("/api/users/:id/following-list", (req, res) => {
+  const rows = db.prepare(`
+    SELECT u.id, u.username, u.display_name, u.avatar_url,
+           EXISTS(SELECT 1 FROM follows WHERE follower_id = u.id AND creator_id = ?) AS is_followed_back
+    FROM follows f
+    JOIN users u ON u.id = f.creator_id
+    WHERE f.follower_id = ?
+    ORDER BY f.created_at DESC
+  `).all(req.params.id, req.params.id);
+  res.json(rows.map((r) => ({
+    id: r.id, username: r.username, displayName: r.display_name || r.username, avatarUrl: r.avatar_url,
+    isMutual: !!r.is_followed_back,
+  })));
+});
+
+/* =========================================================================
+   收藏(本轮新增)
+   ========================================================================= */
+// 收藏/取消收藏(切换)。之前"收藏"只存在前端本地缓存里,现在改成和点赞一样
+// 落到服务端的 collections 表,换设备登录也能看到,个人资料页也能有一个真实的
+// "收藏"标签页。
+app.post("/api/videos/:id/collect", requireAuth, (req, res) => {
+  const videoId = req.params.id;
+  const userId = req.userId;
+  const video = db.prepare("SELECT id FROM videos WHERE id = ?").get(videoId);
+  if (!video) return res.status(404).json({ error: "视频不存在" });
+
+  const existing = db.prepare("SELECT 1 FROM collections WHERE user_id = ? AND video_id = ?").get(userId, videoId);
+  if (existing) {
+    db.prepare("DELETE FROM collections WHERE user_id = ? AND video_id = ?").run(userId, videoId);
+  } else {
+    db.prepare("INSERT INTO collections (user_id, video_id, created_at) VALUES (?, ?, ?)").run(userId, videoId, Date.now());
+  }
+  res.json({ collected: !existing });
+});
+
+// 我收藏过的作品列表(个人资料"收藏"标签页用),只有本人能看自己收藏了什么。
+app.get("/api/users/me/collections", requireAuth, (req, res) => {
+  const videos = db.prepare(`
+    SELECT v.id, v.creator_id, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
+           (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
+    FROM collections c
+    JOIN videos v ON v.id = c.video_id
+    WHERE c.user_id = ? AND v.status = 'published'
+    ORDER BY c.created_at DESC
+  `).all(req.userId);
+  res.json(videos);
+});
+
+/* =========================================================================
+   观看历史(本轮新增)
+   ========================================================================= */
+// 记一次观看历史,和 /api/videos/:id/view(播放量+1)是两件独立的事:播放量是
+// 所有人共享的公开计数,历史浏览是"我自己看过什么"的私人记录,只有登录用户才有。
+// 用 INSERT OR REPLACE,同一条视频重复看只更新时间,不会在历史列表里堆出重复行。
+app.post("/api/videos/:id/watched", requireAuth, (req, res) => {
+  const video = db.prepare("SELECT id FROM videos WHERE id = ?").get(req.params.id);
+  if (!video) return res.status(404).json({ error: "视频不存在" });
+  db.prepare(`
+    INSERT INTO watch_history (user_id, video_id, watched_at) VALUES (?, ?, ?)
+    ON CONFLICT(user_id, video_id) DO UPDATE SET watched_at = excluded.watched_at
+  `).run(req.userId, req.params.id, Date.now());
+  res.json({ ok: true });
+});
+
+// 历史浏览列表(个人资料"历史浏览"标签页用),最近看过的排在最前面,只保留最近 200 条。
+app.get("/api/users/me/history", requireAuth, (req, res) => {
+  const videos = db.prepare(`
+    SELECT v.id, v.creator_id, v.caption, v.video_url, v.thumbnail_url, v.view_count, v.like_count, v.created_at,
+           h.watched_at,
+           (SELECT COUNT(*) FROM comments WHERE video_id = v.id) AS comment_count
+    FROM watch_history h
+    JOIN videos v ON v.id = h.video_id
+    WHERE h.user_id = ? AND v.status = 'published'
+    ORDER BY h.watched_at DESC
+    LIMIT 200
+  `).all(req.userId);
+  res.json(videos);
+});
+
+/* =========================================================================
+   通知(本轮新增)——赞/评论/关注/打赏 + 平台系统公告
+   ========================================================================= */
+// 我的通知列表,关联发起人的"此刻"真实昵称/头像(和评论、Feed 头像同样的思路),
+// 以及(如果有关联视频)视频的封面,方便点开通知直接跳转。
+app.get("/api/notifications", requireAuth, (req, res) => {
+  const rows = db.prepare(`
+    SELECT n.id, n.type, n.actor_id, n.video_id, n.content, n.created_at, n.read_at,
+           u.username AS actor_username, u.display_name AS actor_display_name, u.avatar_url AS actor_avatar_url,
+           v.thumbnail_url AS video_thumbnail_url
+    FROM notifications n
+    LEFT JOIN users u ON u.id = n.actor_id
+    LEFT JOIN videos v ON v.id = n.video_id
+    WHERE n.user_id = ?
+    ORDER BY n.created_at DESC
+    LIMIT 100
+  `).all(req.userId);
+  res.json(rows.map((r) => ({
+    id: r.id, type: r.type, videoId: r.video_id, content: r.content,
+    createdAt: r.created_at, read: !!r.read_at,
+    actor: r.actor_id ? {
+      id: r.actor_id, username: r.actor_username,
+      displayName: r.actor_display_name || r.actor_username,
+      avatarUrl: r.actor_avatar_url,
+    } : null,
+    videoThumbnailUrl: r.video_thumbnail_url || null,
+  })));
+});
+
+app.get("/api/notifications/unread-count", requireAuth, (req, res) => {
+  const row = db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND read_at IS NULL").get(req.userId);
+  res.json({ unreadCount: row.c });
+});
+
+app.post("/api/notifications/mark-read", requireAuth, (req, res) => {
+  db.prepare("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL").run(Date.now(), req.userId);
+  res.json({ ok: true });
+});
+
+// 平台系统公告(本轮新增最基础版本):用 ADMIN_TOKEN 保护,给所有用户群发一条
+// type='system' 的通知。这是"平台和用户之间的推送沟通渠道"最小可用的起点,
+// 还没有可视化的后台界面,发公告目前需要用 ADMIN_TOKEN 手动调用这个接口。
+app.post("/api/admin/notifications/broadcast", requireAdmin, (req, res) => {
+  const { content } = req.body;
+  if (!content || !String(content).trim()) return res.status(400).json({ error: "content 必填" });
+  const users = db.prepare("SELECT id FROM users").all();
+  const now = Date.now();
+  const insertMany = db.transaction((rows) => {
+    const stmt = db.prepare(`
+      INSERT INTO notifications (id, user_id, type, actor_id, video_id, content, created_at)
+      VALUES (?, ?, 'system', NULL, NULL, ?, ?)
+    `);
+    for (const u of rows) stmt.run(uuidv4(), u.id, String(content).trim().slice(0, 500), now);
+  });
+  insertMany(users);
+  res.json({ ok: true, recipientCount: users.length });
+});
+
 /* =========================================================================
    评论
    ========================================================================= */
+// 本轮修复:评论列表关联用户表,取"此刻"真实的昵称和头像(不再是发评论那一刻的
+// 用户名快照),前端才能显示和个人资料一致的头像/昵称,并支持点击跳转到对方主页。
 app.get("/api/videos/:id/comments", (req, res) => {
   const comments = db.prepare(`
-    SELECT id, user_id, username, content, created_at FROM comments WHERE video_id = ? ORDER BY created_at ASC
+    SELECT c.id, c.user_id, c.username, c.content, c.created_at,
+           u.display_name AS display_name, u.avatar_url AS avatar_url
+    FROM comments c
+    LEFT JOIN users u ON u.id = c.user_id
+    WHERE c.video_id = ?
+    ORDER BY c.created_at ASC
   `).all(req.params.id);
-  res.json(comments);
+  res.json(comments.map((c) => ({
+    id: c.id, userId: c.user_id, username: c.username,
+    displayName: c.display_name || c.username,
+    avatarUrl: c.avatar_url || null,
+    content: c.content, created_at: c.created_at,
+  })));
 });
 
 app.post("/api/videos/:id/comments", requireAuth, commentLimiter, (req, res) => {
   const { content } = req.body;
   if (!content || !String(content).trim()) return res.status(400).json({ error: "content 必填" });
 
-  const video = db.prepare("SELECT id FROM videos WHERE id = ?").get(req.params.id);
+  const video = db.prepare("SELECT id, creator_id FROM videos WHERE id = ?").get(req.params.id);
   if (!video) return res.status(404).json({ error: "视频不存在" });
 
-  const user = db.prepare("SELECT id, username FROM users WHERE id = ?").get(req.userId);
+  const user = db.prepare("SELECT id, username, display_name, avatar_url FROM users WHERE id = ?").get(req.userId);
   if (!user) return res.status(401).json({ error: "账号不存在" });
 
   const comment = {
@@ -1145,7 +1410,18 @@ app.post("/api/videos/:id/comments", requireAuth, commentLimiter, (req, res) => 
     VALUES (@id, @video_id, @user_id, @username, @content, @created_at)
   `).run(comment);
 
-  res.json(comment);
+  // 给视频作者发一条"有人评论了你的作品"通知(本轮新增),附带评论内容摘要方便一眼看懂。
+  createNotification({
+    userId: video.creator_id, type: "comment", actorId: user.id, videoId: video.id,
+    content: comment.content.slice(0, 60),
+  });
+
+  res.json({
+    id: comment.id, userId: comment.user_id, username: comment.username,
+    displayName: user.display_name || user.username,
+    avatarUrl: user.avatar_url || null,
+    content: comment.content, created_at: comment.created_at,
+  });
 });
 
 /* =========================================================================
@@ -1187,18 +1463,22 @@ app.patch("/api/users/:id", requireAuth, (req, res) => {
   res.json(publicUserView(updated));
 });
 
-// 头像 / 个人资料背景图上传:和视频上传复用同一套"预签名直传 R2"模式,
-// 只是换了存储路径前缀(avatars/ 或 backgrounds/)和校验(必须是 image/*)。
+// 头像 / 个人资料背景图 / 视频封面图上传:都是同一套"预签名直传 R2"模式,
+// 只是换了存储路径前缀和校验(必须是 image/*)。
+// 本轮新增 "thumbnail" 这个 kind——配合前端发布视频时新增的"客户端截帧生成封面"
+// 逻辑,解决作品栏/首页视频没有封面、只能看到纯色空框的问题。
 app.post("/api/users/me/image-upload-url", requireAuth, uploadLimiter, async (req, res) => {
   const { kind, filename, contentType } = req.body;
-  if (!["avatar", "background"].includes(kind)) return res.status(400).json({ error: "kind 必须是 avatar 或 background" });
+  if (!["avatar", "background", "thumbnail"].includes(kind)) {
+    return res.status(400).json({ error: "kind 必须是 avatar、background 或 thumbnail" });
+  }
   if (!filename || !contentType) return res.status(400).json({ error: "filename 和 contentType 必填" });
   if (!String(contentType).startsWith("image/")) return res.status(400).json({ error: "只能上传图片文件" });
   if (!process.env.R2_BUCKET_NAME || !process.env.R2_ACCOUNT_ID) {
     return res.status(500).json({ error: "服务端未配置 R2 存储,无法生成上传地址,请检查 .env" });
   }
 
-  const prefix = kind === "avatar" ? "avatars" : "backgrounds";
+  const prefix = kind === "avatar" ? "avatars" : kind === "background" ? "backgrounds" : "thumbnails";
   const objectKey = `${prefix}/${req.userId}-${Date.now()}-${String(filename).replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 
   try {
@@ -1258,6 +1538,20 @@ app.get("/api/conversations", requireAuth, (req, res) => {
     ORDER BY last_message_at DESC
   `).all(req.userId);
   res.json(rows);
+});
+
+// 本轮新增:私信入口的小红点角标要用——把这个人所有会话里的未读消息数加起来,
+// 不用像 /api/conversations 那样把整个会话列表(含最后一条消息内容)都传回来,
+// 首页每次要刷新角标时用这个轻量接口就够了。
+app.get("/api/conversations/unread-count", requireAuth, (req, res) => {
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(
+      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = cm.conversation_id AND m.created_at > cm.last_read_at)
+    ), 0) AS total
+    FROM conversation_members cm
+    WHERE cm.user_id = ?
+  `).get(req.userId);
+  res.json({ unreadCount: row.total });
 });
 
 app.post("/api/conversations/direct", requireAuth, (req, res) => {
