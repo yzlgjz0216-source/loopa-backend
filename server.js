@@ -806,13 +806,73 @@ app.post("/api/auth/logout", (req, res) => {
    ========================================================================= */
 const PI_API_BASE = "https://api.minepi.com/v2";
 
-app.post("/api/payments/approve", requireAuth, paymentLimiter, async (req, res) => {
-  const { paymentId, creatorId } = req.body;
-  if (!paymentId) return res.status(400).json({ error: "paymentId 必填" });
-  if (!process.env.PI_API_KEY) {
-    console.error("[Payment] ⚠️ PI_API_KEY 未配置,无法调用 Pi 官方 API,批准请求已中止");
-    return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
+// 本轮新增(2026-09-19):把"sandbox 测试模式"从前端硬编码改成服务端 .env 一个开关
+// 就能控制。背景:Pi 官方的沙盒(Testnet)支付和正式(主网)支付是两套完全独立的
+// 环境,一边用 sandbox:true 发起支付、一边拿正式环境的 PI_API_KEY 去校验,Pi 官方
+// 接口会直接 401 拒绝——这正是这几轮一直在排查的打赏失败问题。
+// 但正式环境的支付要求打赏人/充值人的 Pi 钱包必须已经开通主网,现在还在内部测试
+// 阶段(用户明确要求"先把网页端完善好,等正式上线后再切换"),不方便要求每个测试者
+// 都先去开通主网钱包。所以这里加一个 PI_SANDBOX_MODE 开关:开着的时候,打赏/充值
+// 的批准与确认完全不请求 Pi 官方服务器,直接在我们自己服务器里"当作已验证通过"
+// 处理(仍然会正常写入数据库、正常加钻石/加金币),这样任何钱包(不管有没有开通
+// 主网)都能把打赏/充值的全套流程(UI、余额、通知)完整测通;唯一的代价是这个
+// 模式下不会有真实的 Pi 从任何人账户转出——这是内部测试阶段完全可以接受的,
+// 但正式对外上线前必须把这个开关关掉,不然等于任何人不用真的付钱就能"打赏成功"。
+const PI_SANDBOX_MODE = process.env.PI_SANDBOX_MODE === "true";
+if (PI_SANDBOX_MODE) {
+  console.warn("\n" + "⚠️ ".repeat(12));
+  console.warn("[Pi] PI_SANDBOX_MODE=true —— 当前处于内部测试模式!");
+  console.warn("[Pi] 所有打赏/充值的批准与确认都不会真的请求 Pi 官方服务器,直接当作验证通过处理。");
+  console.warn("[Pi] 任何钱包(包括没有开通主网的)都能测通完整流程,但不会有真实 Pi 转账发生。");
+  console.warn("[Pi] 正式对外上线前,必须把 .env 里的 PI_SANDBOX_MODE 改成 false(或整行删掉)!");
+  console.warn("⚠️ ".repeat(12) + "\n");
+}
+
+// 统一封装"请求 Pi 官方批准/确认一笔支付"。PI_SANDBOX_MODE=true 时完全不发出真实
+// 网络请求,直接返回一个用前端传来的 amount/memo/metadata 拼出来的"已批准"假支付
+// 对象——只在测试模式下相信客户端这几个字段,正式模式下这几个字段完全不会被用到,
+// 真正生效的金额/备注始终以 Pi 官方接口返回的 payment 为准,不受这里影响。
+async function callPiApi(action, paymentId, body) {
+  if (PI_SANDBOX_MODE) {
+    return {
+      ok: true,
+      sandboxMocked: true,
+      payment: {
+        identifier: paymentId,
+        amount: Number(body?.amount) || 0,
+        memo: body?.memo || null,
+        metadata: body?.metadata || {},
+      },
+    };
   }
+  if (!process.env.PI_API_KEY) {
+    return { ok: false, status: 500, error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" };
+  }
+  const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/${action}`, {
+    method: "POST",
+    headers:
+      action === "complete"
+        ? { Authorization: `Key ${process.env.PI_API_KEY}`, "Content-Type": "application/json" }
+        : { Authorization: `Key ${process.env.PI_API_KEY}` },
+    body: action === "complete" ? JSON.stringify(body) : undefined,
+  });
+  if (!response.ok) {
+    const errText = await response.text();
+    return { ok: false, status: 502, error: "Pi 官方 API 请求失败", detail: errText };
+  }
+  return { ok: true, payment: await response.json() };
+}
+
+// 供前端启动时读取的公开配置。前端用这个决定 Pi.init({ sandbox: ... }) 传
+// true 还是 false —— 这样前后端的沙盒/正式模式永远保持一致,不会再出现
+// 之前那种"前端 sandbox:true、后端却拿正式 key 校验"导致的 401 错位问题。
+app.get("/api/config/public", (req, res) => {
+  res.json({ piSandbox: PI_SANDBOX_MODE });
+});
+
+app.post("/api/payments/approve", requireAuth, paymentLimiter, async (req, res) => {
+  const { paymentId, creatorId, amount, memo, metadata } = req.body;
+  if (!paymentId) return res.status(400).json({ error: "paymentId 必填" });
 
   // 年龄分级限制(GPT-6审计:之前 TEEN_MODE_RESTRICTIONS 只在前端定义,服务端从未真正执行)
   const buyer = db.prepare("SELECT age_tier FROM users WHERE id = ?").get(req.userId);
@@ -834,16 +894,12 @@ app.post("/api/payments/approve", requireAuth, paymentLimiter, async (req, res) 
   }
 
   try {
-    const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/approve`, {
-      method: "POST",
-      headers: { Authorization: `Key ${process.env.PI_API_KEY}` },
-    });
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("[Pi API] 批准支付失败:", response.status, errText);
-      return res.status(502).json({ ok: false, error: "Pi 官方 API 批准失败", detail: errText });
+    const result = await callPiApi("approve", paymentId, { amount, memo, metadata: metadata || { creatorId, creatorName } });
+    if (!result.ok) {
+      console.error("[Pi API] 批准支付失败:", result.status, result.error, result.detail || "");
+      return res.status(result.status || 500).json({ ok: false, error: result.error, detail: result.detail });
     }
-    const payment = await response.json();
+    const payment = result.payment;
 
     try {
       const amountUnits = Math.round(Number(payment.amount) * 10000000);
@@ -869,23 +925,14 @@ app.post("/api/payments/approve", requireAuth, paymentLimiter, async (req, res) 
 app.post("/api/payments/complete", requireAuth, paymentLimiter, async (req, res) => {
   const { paymentId, txid } = req.body;
   if (!paymentId || !txid) return res.status(400).json({ error: "paymentId 和 txid 必填" });
-  if (!process.env.PI_API_KEY) {
-    console.error("[Payment] ⚠️ PI_API_KEY 未配置,无法调用 Pi 官方 API,完成请求已中止");
-    return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
-  }
 
   try {
-    const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/complete`, {
-      method: "POST",
-      headers: { Authorization: `Key ${process.env.PI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ txid }),
-    });
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("[Pi API] 完成支付确认失败:", response.status, errText);
-      return res.status(502).json({ ok: false, error: "Pi 官方 API 完成确认失败", detail: errText });
+    const result = await callPiApi("complete", paymentId, { txid });
+    if (!result.ok) {
+      console.error("[Pi API] 完成支付确认失败:", result.status, result.error, result.detail || "");
+      return res.status(result.status || 500).json({ ok: false, error: result.error, detail: result.detail });
     }
-    const payment = await response.json();
+    const payment = result.payment;
 
     // ⚠️ 支付幂等性核心修复(GPT-6 P0-3):用原子的
     // "UPDATE ... WHERE status='approved'" 加 .changes 判断,只有真正把状态
@@ -1929,24 +1976,16 @@ app.get("/api/wallet/me", requireAuth, (req, res) => {
 // coin_purchases 而不是 tips)。coin_amount 按下单那一刻的固定汇率算好存起来,
 // 即使汇率以后调整也不影响这笔已经发起的订单。
 app.post("/api/wallet/purchase/approve", requireAuth, paymentLimiter, async (req, res) => {
-  const { paymentId } = req.body;
+  const { paymentId, amount, memo, metadata } = req.body;
   if (!paymentId) return res.status(400).json({ error: "paymentId 必填" });
-  if (!process.env.PI_API_KEY) {
-    console.error("[Wallet] ⚠️ PI_API_KEY 未配置,无法调用 Pi 官方 API,批准请求已中止");
-    return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
-  }
 
   try {
-    const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/approve`, {
-      method: "POST",
-      headers: { Authorization: `Key ${process.env.PI_API_KEY}` },
-    });
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("[Pi API] 批准金币充值支付失败:", response.status, errText);
-      return res.status(502).json({ ok: false, error: "Pi 官方 API 批准失败", detail: errText });
+    const result = await callPiApi("approve", paymentId, { amount, memo, metadata });
+    if (!result.ok) {
+      console.error("[Pi API] 批准金币充值支付失败:", result.status, result.error, result.detail || "");
+      return res.status(result.status || 500).json({ ok: false, error: result.error, detail: result.detail });
     }
-    const payment = await response.json();
+    const payment = result.payment;
 
     try {
       const piAmountUnits = Math.round(Number(payment.amount) * 10000000);
@@ -1973,23 +2012,14 @@ app.post("/api/wallet/purchase/approve", requireAuth, paymentLimiter, async (req
 app.post("/api/wallet/purchase/complete", requireAuth, paymentLimiter, async (req, res) => {
   const { paymentId, txid } = req.body;
   if (!paymentId || !txid) return res.status(400).json({ error: "paymentId 和 txid 必填" });
-  if (!process.env.PI_API_KEY) {
-    console.error("[Wallet] ⚠️ PI_API_KEY 未配置,无法调用 Pi 官方 API,完成请求已中止");
-    return res.status(500).json({ error: "服务端未配置 PI_API_KEY,无法调用 Pi 官方 API" });
-  }
 
   try {
-    const response = await fetch(`${PI_API_BASE}/payments/${paymentId}/complete`, {
-      method: "POST",
-      headers: { Authorization: `Key ${process.env.PI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ txid }),
-    });
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("[Pi API] 完成金币充值确认失败:", response.status, errText);
-      return res.status(502).json({ ok: false, error: "Pi 官方 API 完成确认失败", detail: errText });
+    const result = await callPiApi("complete", paymentId, { txid });
+    if (!result.ok) {
+      console.error("[Pi API] 完成金币充值确认失败:", result.status, result.error, result.detail || "");
+      return res.status(result.status || 500).json({ ok: false, error: result.error, detail: result.detail });
     }
-    const payment = await response.json();
+    const payment = result.payment;
 
     let newCoinBalance = null;
     try {
